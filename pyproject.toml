@@ -3,11 +3,19 @@ name = "datascience"
 version = "0.1.0"
 description = "Forecasting and optimization for district heating dispatch"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "pyomo",
+    "highspy",
+    "jupyter",
+    "ipykernel",
+]
 
 [build-system]
-requires = ["setuptools>=75.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
