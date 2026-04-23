@@ -218,4 +218,4 @@ __marimo__/
 *.joblib
 
 # Local notebook data
-notebooks/optimization/Data/
+notebooks/optimization/data/
