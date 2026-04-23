@@ -216,6 +216,3 @@ __marimo__/
 # Model artifacts
 *.pkl
 *.joblib
-
-# V(SoC) exploration: commit small training data pickle for reproducibility
-!notebooks/optimization/learned_v_training_data.pkl
