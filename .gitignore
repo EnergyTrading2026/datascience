@@ -216,3 +216,6 @@ __marimo__/
 # Model artifacts
 *.pkl
 *.joblib
+
+# Local notebook data
+notebooks/optimization/Data/
