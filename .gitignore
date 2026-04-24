@@ -217,5 +217,5 @@ __marimo__/
 *.pkl
 *.joblib
 
-# Local notebook data
-notebooks/optimization/data/
+# Local data
+data/
