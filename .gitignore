@@ -217,5 +217,8 @@ __marimo__/
 *.pkl
 *.joblib
 
-# Local data
-data/
+# Data for forecasting is limited, cleaned, and processed, so we want to keep it in version control. 
+# However, optimization data was local before, and may be large, so we want to ignore it. 
+# The Subteam Optimization may want to add some files in data/optimization to version control, so we add an exception for .gitkeep.
+data/optimization/* 
+!data/optimization/.gitkeep
