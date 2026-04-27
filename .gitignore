@@ -218,9 +218,12 @@ __marimo__/
 *.joblib
 
 
-# Generally most data should be generated from source and not checked in,
-# but we want to keep the raw data for the forecasting pipeline
+
 data/*
+!data/forecasting/
+data/forecasting/*
+!data/forecasting/raw/
 !data/forecasting/.gitkeep
-!data/forecasting/raw/*
+!data/optimization/
+data/optimization/*
 !data/optimization/.gitkeep
