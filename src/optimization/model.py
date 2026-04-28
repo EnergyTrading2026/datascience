@@ -60,11 +60,6 @@ def build_model(
         `m._params`, `m._horizon_hours`, `m._horizon_start` for downstream use.
     """
     horizon_hours = _validate_inputs(forecast_demand_mw_th, da_prices_eur_mwh)
-    if demand_safety_factor < 1.0:
-        # Allow but warn semantically: <1 deflates planned demand, increases unserved risk.
-        # We don't raise — the caller may have a reason. Document in run.py logs.
-        pass
-
     p = params
     dt = p.dt_h
     T = horizon_hours * INT_PER_HOUR
