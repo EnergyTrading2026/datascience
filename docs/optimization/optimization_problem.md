@@ -1,5 +1,7 @@
 # District Heating Optimization Problem
 
+> **Note:** This document defines the MILP formulation (decision variables, constraints, objective, parameters). The production system runs an hourly MPC variant of this problem — see [`hourly_mpc.md`](hourly_mpc.md) for the architecture, rolling-horizon mechanics, and orchestration. Where the two documents disagree on horizon length or rolling-horizon cadence, `hourly_mpc.md` is current.
+
 MILP for 24 h dispatch of Heat Pump, Condensing Boiler, CHP, and Thermal Storage against day-ahead (DA) electricity prices. Minimizes gas + CO2 + electricity cost net of CHP electricity revenue.
 
 ## Time Structure
