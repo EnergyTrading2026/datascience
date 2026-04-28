@@ -217,5 +217,13 @@ __marimo__/
 *.pkl
 *.joblib
 
-# Local data
-data/
+
+
+data/*
+!data/forecasting/
+data/forecasting/*
+!data/forecasting/raw/
+!data/forecasting/.gitkeep
+!data/optimization/
+data/optimization/*
+!data/optimization/.gitkeep

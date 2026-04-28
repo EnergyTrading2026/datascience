@@ -22,6 +22,7 @@ src/            Production code (forecasting + optimization)
 notebooks/      Jupyter notebooks for exploration and prototyping
 tests/          Automated tests
 docs/           Problem definitions, methodology notes
+data/           Data (raw and cleaned)
 ```
 
 ## Workflow
