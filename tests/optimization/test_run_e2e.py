@@ -15,7 +15,7 @@ from optimization.adapters.forecast import DEMAND_COLUMN
 from optimization.run import run_one_cycle
 from optimization.state import DispatchState
 
-PRICES_CSV = Path("data/Gro_handelspreise_202403010000_202603020000_Stunde.csv")
+PRICES_CSV = Path("data/optimization/raw/Gro_handelspreise_202403010000_202603020000_Stunde.csv")
 
 
 @pytest.mark.skipif(not PRICES_CSV.exists(), reason="SMARD CSV not present in data/")

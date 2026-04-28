@@ -227,3 +227,8 @@ data/forecasting/*
 !data/optimization/
 data/optimization/*
 !data/optimization/.gitkeep
+!data/optimization/raw/
+
+# Backtest outputs
+out/
+>>>>>>> cb1d68d (Align data layout with forecasting team conventions)
