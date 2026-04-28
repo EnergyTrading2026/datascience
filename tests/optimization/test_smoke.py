@@ -10,10 +10,12 @@ If this test fails, the lift broke something — investigate before adding logic
 """
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from optimization.model import build_model
-from optimization.solve import solve
+from optimization.solve import SolverInfeasibleError, solve
+from optimization.state import TIS_LONG, DispatchState
 
 
 def test_solves_constant_demand_matches_notebook(constant_inputs_35h, cold_state, params_no_floor):
@@ -32,3 +34,33 @@ def test_solves_with_hard_floor_feasible(constant_inputs_35h, cold_state, params
     model = build_model(demand, price, cold_state, params, demand_safety_factor=1.0)
     result = solve(model, time_limit_s=30, mip_gap=0.005)
     assert result.feasible
+
+
+def test_solve_raises_on_infeasible_model(params):
+    """Regression for the Pyomo-HiGHS no-feasible-solution path.
+
+    When HiGHS terminates without an incumbent, Pyomo's appsi wrapper raises
+    RuntimeError directly from solver.solve(...). The wrapper must catch that
+    and reraise as SolverInfeasibleError so callers have a single contract.
+
+    Construct a deliberately infeasible configuration: the boiler is forced ON
+    by a min-up obligation carried over from the previous solve, but demand is
+    below the boiler's Q_min and storage is at the upper bound, so the excess
+    heat has no destination.
+    """
+    idx = pd.date_range("2026-01-01", periods=4, freq="1h", tz="Europe/Berlin")
+    demand = pd.Series(1.5, index=idx, name="demand_mw_th")
+    price = pd.Series(50.0, index=idx, name="price_eur_mwh")
+
+    state = DispatchState(
+        timestamp=idx[0],
+        sto_soc_mwh_th=params.sto_capacity_mwh_th,
+        hp_on=0,
+        boiler_on=1,
+        boiler_time_in_state_steps=1,
+        chp_on=0,
+        chp_time_in_state_steps=TIS_LONG,
+    )
+    model = build_model(demand, price, state, params)
+    with pytest.raises(SolverInfeasibleError):
+        solve(model)
