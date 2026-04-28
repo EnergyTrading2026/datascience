@@ -39,7 +39,12 @@ def solve(
     solver.options["mip_rel_gap"] = mip_gap
 
     t0 = time.time()
-    res = solver.solve(model, tee=False)
+    try:
+        res = solver.solve(model, tee=False)
+    except RuntimeError as e:
+        if "feasible solution was not found" in str(e):
+            raise SolverInfeasibleError(f"HiGHS produced no feasible solution: {e}") from e
+        raise
     elapsed = time.time() - t0
 
     cond = res.solver.termination_condition
