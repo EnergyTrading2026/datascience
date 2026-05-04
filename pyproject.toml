@@ -25,3 +25,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: integration tests that hit the real SMARD API (skipped by default; run with `pytest -m live`)",
+]
+addopts = "-m 'not live'"
