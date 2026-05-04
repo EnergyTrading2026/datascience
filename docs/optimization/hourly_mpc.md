@@ -11,7 +11,7 @@ Three time concepts, distinct on purpose:
 | Concept | Value | Meaning |
 |---|---|---|
 | **Step** | 15 min (`dt = 0.25 h`) | MILP discretization grid |
-| **Plan horizon** | 12–35 h, target 35 h | How far the MILP looks ahead. `T = horizon_h × 4` steps. Determined per cycle by the joint coverage of demand forecast and DA prices. Below 12 h the cycle fails loudly. |
+| **Plan horizon** | 11–35 h, target 35 h | How far the MILP looks ahead. `T = horizon_h × 4` steps. Determined per cycle by the joint coverage of demand forecast and DA prices. Below 11 h the cycle fails loudly. The 11 h floor is set so the daily 13:00 cycle (11 h pre-EPEX-clearing visibility) still runs. |
 | **Commit horizon** | 1 h (4 steps) | Setpoints from the first hour of the solved plan are emitted as "the plan". Steps beyond are advisory and get overwritten by the next solve. |
 | **Cadence** | hourly | One full solve every hour. |
 
@@ -31,7 +31,7 @@ SMARD publishes the day-ahead auction around 12:45 Berlin local, with prices for
 - `t` shortly before publish (e.g. 12:30) → prices reach only to today 24:00 → ≈ 12 h
 - `t` overnight → coverage shrinks toward the today-24:00 boundary
 
-The plan horizon adapts to this — `RuntimeConfig.horizon_hours_target = 35`, `horizon_hours_min = 12`. If neither forecast nor prices cover at least 12 h forward, the cycle returns exit-code 1 (recoverable).
+The plan horizon adapts to this — `RuntimeConfig.horizon_hours_target = 35`, `horizon_hours_min = 11`. The 11 h floor exactly accommodates the 13:00 cycle (11 h until midnight, before EPEX clears at ~12:45 and SMARD mirrors by ~13:45). If neither forecast nor prices cover at least 11 h forward, the cycle returns exit-code 1 (recoverable).
 
 ## Cycle flow
 
@@ -69,7 +69,7 @@ The plan horizon adapts to this — `RuntimeConfig.horizon_hours_target = 35`, `
 | Format | Parquet |
 | Index | hourly, tz-aware Europe/Berlin |
 | Column | `demand_mw_th` (float, MW thermal) |
-| Length | ≥ 12 h starting at the next full hour after `solve_time` |
+| Length | ≥ 11 h starting at the next full hour after `solve_time` |
 | NaN | not allowed |
 
 The schema is enforced strictly — violations raise `ForecastSchemaError`. The contract is V1 placeholder and will be locked down in a separate forecast-contract document.

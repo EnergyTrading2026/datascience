@@ -65,7 +65,7 @@ class RuntimeConfig:
     """Operational tuning. Tweak per deployment without touching plant physics."""
 
     horizon_hours_target: int = 35     # ideal forward-look (35h matches mpc_prototype)
-    horizon_hours_min: int = 12        # below this, fail loudly (DevOps must alert)
+    horizon_hours_min: int = 11        # covers the 13:00 pre-EPEX-clearing cycle (11h until midnight)
     commit_hours: int = 1              # hourly cadence -> 1h commit, 4 intervals
     solver_time_limit_s: int = 30
     solver_mip_gap: float = 0.005

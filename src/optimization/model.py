@@ -4,6 +4,8 @@ hard floor on storage SoC enabled by default.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
@@ -11,7 +13,10 @@ import pyomo.environ as pyo
 from optimization.config import PlantParams
 from optimization.state import TIS_LONG, DispatchState
 
-INT_PER_HOUR = 4  # 15-min grid
+INT_PER_HOUR = 4  # 15-min grid (model is always 15-min internally)
+
+Resolution = Literal["hour", "quarterhour"]
+_REPEAT_FACTOR: dict[str, int] = {"hour": INT_PER_HOUR, "quarterhour": 1}
 
 
 def _validate_inputs(forecast: pd.Series, prices: pd.Series) -> int:
@@ -41,32 +46,42 @@ def build_model(
     state: DispatchState,
     params: PlantParams,
     demand_safety_factor: float = 1.0,
+    resolution: Resolution = "hour",
 ) -> pyo.ConcreteModel:
     """Build a dispatch MILP over the joint horizon of forecast and prices.
 
     The MILP is the validated 15-min formulation from mpc_prototype.ipynb cell 3:
     energy balance, storage dynamics, unit min-up/min-down, CHP startup cost.
-    Hourly inputs are broadcast into 4 fifteen-min steps each; T = horizon_h * 4.
+    Inputs are broadcast onto the 15-min internal grid via a per-resolution
+    repeat factor (hour -> 4, quarterhour -> 1). Forecast and prices must be
+    at the same resolution.
 
     Args:
-        forecast_demand_mw_th: hourly demand (MW_th), tz-aware index.
-        da_prices_eur_mwh: hourly DA prices (EUR/MWh_el), tz-aware index aligned to forecast.
+        forecast_demand_mw_th: demand (MW_th), tz-aware index at `resolution` granularity.
+        da_prices_eur_mwh: DA prices (EUR/MWh_el), tz-aware index aligned to forecast.
         state: carry-over state from previous commit (or DispatchState.cold_start).
         params: plant constants.
         demand_safety_factor: planner sees demand * factor (>=1 = robust planning).
+        resolution: 'hour' or 'quarterhour'. Determines the repeat factor used
+            to broadcast inputs onto the 15-min model grid.
 
     Returns:
         pyomo.ConcreteModel ready to be solved by `solve.solve(...)`. Stashes
         `m._params`, `m._horizon_hours`, `m._horizon_start` for downstream use.
     """
-    horizon_hours = _validate_inputs(forecast_demand_mw_th, da_prices_eur_mwh)
+    if resolution not in _REPEAT_FACTOR:
+        raise ValueError(f"resolution must be 'hour' or 'quarterhour'; got {resolution!r}")
+    slots = _validate_inputs(forecast_demand_mw_th, da_prices_eur_mwh)
     p = params
     dt = p.dt_h
-    T = horizon_hours * INT_PER_HOUR
+    repeat_factor = _REPEAT_FACTOR[resolution]
+    T = slots * repeat_factor
+    horizon_hours = T // INT_PER_HOUR
     demand_15 = np.repeat(
-        np.asarray(forecast_demand_mw_th.to_numpy(), float) * demand_safety_factor, INT_PER_HOUR
+        np.asarray(forecast_demand_mw_th.to_numpy(), float) * demand_safety_factor,
+        repeat_factor,
     )
-    price_15 = np.repeat(np.asarray(da_prices_eur_mwh.to_numpy(), float), INT_PER_HOUR)
+    price_15 = np.repeat(np.asarray(da_prices_eur_mwh.to_numpy(), float), repeat_factor)
 
     m = pyo.ConcreteModel("DistrictHeatingMILP")
     m.T_set = pyo.RangeSet(1, T)

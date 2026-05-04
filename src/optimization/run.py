@@ -1,21 +1,28 @@
 """CLI entrypoint for one hourly MPC dispatch cycle.
 
-Usage:
+Usage (production: live SMARD pull, hourly resolution):
     python -m optimization.run \\
         --solve-time 2026-04-28T13:00:00+02:00 \\
         --forecast-path /shared/forecast/latest.parquet \\
-        --prices-path  /shared/smard/latest.csv \\
         --state-in     /shared/state/current.json \\
         --state-out    /shared/state/current.json \\
         --dispatch-out /shared/dispatch/<solve_time>.parquet
 
-DevOps wraps this in a container + scheduler. We don't ship the scheduler.
+Backtest / replay against a historical SMARD CSV:
+        --prices-source csv --prices-path /shared/smard/latest.csv
+
+Quarter-hour resolution (requires QH demand forecast and QH-DA-aware backtest):
+        --resolution quarterhour
+
+DevOps provides the server/scheduler/storage; the optimizer owns data
+ingestion (live SMARD adapter, forecast load, validation).
 
 Exit codes:
     0 = success, dispatch + state written
-    1 = recoverable failure (forecast/price file missing, horizon too short) — DevOps retries
+    1 = recoverable failure (forecast/price file missing, horizon too short,
+        SMARD API unreachable) — scheduler retries
     2 = solver infeasible — alert, manual intervention needed
-    3 = unexpected error — page
+    3 = unexpected error (incl. SMARD schema break) — page
 """
 from __future__ import annotations
 
@@ -24,10 +31,12 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from optimization.adapters import forecast as forecast_io
 from optimization.adapters import smard as smard_io
+from optimization.adapters import smard_live as smard_live_io
 from optimization.config import PlantParams, RuntimeConfig
 from optimization.dispatch import extract_dispatch, extract_state
 from optimization.model import build_model
@@ -37,6 +46,7 @@ from optimization.state import DispatchState
 logger = logging.getLogger("optimization.run")
 
 INT_PER_HOUR = 4
+_SLOTS_PER_HOUR: dict[str, int] = {"hour": 1, "quarterhour": 4}
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,10 +59,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--forecast-path", required=True, type=Path)
     p.add_argument(
+        "--prices-source",
+        choices=["live", "csv"],
+        default="live",
+        help="Where to get DA prices. 'live' pulls from SMARD chart_data API "
+             "(production default). 'csv' reads a SMARD-format CSV (backtest).",
+    )
+    p.add_argument(
         "--prices-path",
-        required=True,
         type=Path,
-        help="SMARD CSV path (semicolon-separated). V2 may switch to live API.",
+        help="SMARD CSV path (semicolon-separated). Required when "
+             "--prices-source=csv; ignored otherwise.",
+    )
+    p.add_argument(
+        "--resolution",
+        choices=["hour", "quarterhour"],
+        default="quarterhour",
+        help="Model resolution. Default 'quarterhour' = production setup: "
+             "live 15-min DA prices from SMARD paired with hourly demand "
+             "forecast (forward-filled to 15-min).",
+    )
+    p.add_argument(
+        "--forecast-resolution",
+        choices=["hour", "quarterhour"],
+        default="hour",
+        help="Resolution of the forecast file. Default 'hour' (= what the "
+             "forecasting team delivers). With --resolution=quarterhour this "
+             "triggers forward-fill of demand to 15-min.",
     )
     p.add_argument(
         "--state-in",
@@ -69,24 +102,90 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _upsample_hour_to_quarterhour(s: pd.Series) -> pd.Series:
+    """Forward-fill an hourly Series to 15-min resolution: each hour -> 4 slots.
+
+    For thermally smooth district-heating demand, replicating the hourly value
+    across the four 15-min sub-slots is a defensible approximation (network and
+    building thermal inertia smooth out sub-hour variation). Lets the model see
+    real intra-hour price spreads while keeping the existing forecast contract.
+    """
+    if len(s) == 0:
+        return s
+    new_idx = pd.date_range(
+        start=s.index[0],
+        periods=len(s) * INT_PER_HOUR,
+        freq="15min",
+        tz=s.index.tz,
+    )
+    return pd.Series(np.repeat(s.to_numpy(), INT_PER_HOUR), index=new_idx, name=s.name)
+
+
 def run_one_cycle(
     solve_time: pd.Timestamp,
     forecast_path: Path,
-    prices_path: Path,
+    prices_path: Path | None,
     state_in: Path | None,
     state_out: Path,
     dispatch_out: Path,
     cold_start: bool,
     params: PlantParams | None = None,
     runtime: RuntimeConfig | None = None,
+    prices_source: str = "live",
+    resolution: str = "quarterhour",
+    forecast_resolution: str | None = "hour",
 ) -> int:
-    """Run one hourly cycle. Returns exit code (0/1/2)."""
+    """Run one hourly cycle. Returns exit code (0/1/2/3).
+
+    Args:
+        prices_source: 'live' (SMARD chart_data API, prod default) or 'csv'
+            (SMARD-format CSV, backtest).
+        resolution: model resolution, 'hour' or 'quarterhour'.
+        forecast_resolution: resolution of the forecast file. Defaults to
+            `resolution`. Allowed mismatch: 'hour' file + 'quarterhour' model
+            (demand gets forward-filled). The inverse loses information and is
+            rejected.
+    """
     if solve_time.tzinfo is None:
         logger.error("solve-time must be tz-aware")
+        return 1
+    if prices_source not in ("live", "csv"):
+        logger.error("prices_source must be 'live' or 'csv'; got %r", prices_source)
+        return 1
+    if resolution not in _SLOTS_PER_HOUR:
+        logger.error("resolution must be 'hour' or 'quarterhour'; got %r", resolution)
+        return 1
+    forecast_resolution = forecast_resolution or resolution
+    if forecast_resolution not in _SLOTS_PER_HOUR:
+        logger.error(
+            "forecast_resolution must be 'hour' or 'quarterhour'; got %r",
+            forecast_resolution,
+        )
+        return 1
+    if forecast_resolution != resolution and not (
+        forecast_resolution == "hour" and resolution == "quarterhour"
+    ):
+        logger.error(
+            "unsupported resolution combo: forecast=%s, model=%s. "
+            "Allowed: identical, or forecast=hour + model=quarterhour (hybrid).",
+            forecast_resolution, resolution,
+        )
+        return 1
+    if prices_source == "csv" and prices_path is None:
+        logger.error("--prices-path required when --prices-source=csv")
+        return 1
+    if prices_source == "csv" and resolution != "hour":
+        logger.error(
+            "--prices-source csv only supports --resolution hour "
+            "(historical SMARD CSV is hourly); got resolution=%s",
+            resolution,
+        )
         return 1
 
     params = params or PlantParams()
     rt = runtime or RuntimeConfig()
+    slots_per_hour = _SLOTS_PER_HOUR[resolution]
+    hybrid_mode = forecast_resolution != resolution
 
     # 1. Load state
     if cold_start:
@@ -105,33 +204,64 @@ def run_one_cycle(
 
     # 2. Fetch inputs
     try:
-        forecast = forecast_io.load_forecast(forecast_path, solve_time)
+        forecast = forecast_io.load_forecast(
+            forecast_path, solve_time, resolution=forecast_resolution
+        )
     except (FileNotFoundError, forecast_io.ForecastSchemaError, ValueError) as e:
         logger.error("forecast load failed: %s", e)
         return 1
     try:
-        prices = smard_io.get_published_prices(solve_time, prices_path)
+        if prices_source == "live":
+            prices = smard_live_io.get_published_prices(solve_time, resolution=resolution)
+        else:
+            prices = smard_io.get_published_prices(solve_time, prices_path)
+    except smard_live_io.SmardApiUnavailableError as e:
+        logger.error("SMARD live unavailable: %s", e)
+        return 1
     except (FileNotFoundError, ValueError) as e:
         logger.error("price load failed: %s", e)
         return 1
 
-    # 3. Reconcile horizons
-    horizon_h = min(len(forecast), len(prices))
-    if horizon_h < rt.horizon_hours_min:
+    # 2b. Hybrid mode: upsample hourly demand onto the QH grid, then align starts.
+    # Both adapters anchor independently (forecast at next hour, prices at next 15-min),
+    # so when solve_time is off-hour the two starts disagree by < 1h. We trim to the
+    # later of the two starts so model.py sees aligned indices.
+    if hybrid_mode:
+        forecast = _upsample_hour_to_quarterhour(forecast)
+        common_start = max(forecast.index[0], prices.index[0])
+        forecast = forecast.loc[common_start:]
+        prices = prices.loc[common_start:]
+        logger.info(
+            "hybrid mode: hourly demand forward-filled to 15-min, common start=%s",
+            common_start,
+        )
+
+    # 3. Reconcile horizons (in slots; thresholds are configured in hours)
+    min_slots = rt.horizon_hours_min * slots_per_hour
+    target_slots = rt.horizon_hours_target * slots_per_hour
+    horizon_slots = min(len(forecast), len(prices))
+    if horizon_slots < min_slots:
         logger.error(
-            "horizon too short: forecast=%dh prices=%dh min=%dh",
-            len(forecast), len(prices), rt.horizon_hours_min,
+            "horizon too short: forecast=%d slots, prices=%d slots, min=%d slots (%dh @ %s)",
+            len(forecast), len(prices), min_slots, rt.horizon_hours_min, resolution,
         )
         return 1
-    horizon_h = min(horizon_h, rt.horizon_hours_target)
-    forecast = forecast.iloc[:horizon_h]
-    prices = prices.iloc[:horizon_h]
-    logger.info("horizon=%dh (forecast=%dh available, prices=%dh available)",
-                horizon_h, len(forecast), len(prices))
+    horizon_slots = min(horizon_slots, target_slots)
+    forecast = forecast.iloc[:horizon_slots]
+    prices = prices.iloc[:horizon_slots]
+    logger.info(
+        "horizon=%d slots (%.1fh @ %s); forecast=%d, prices=%d available",
+        horizon_slots, horizon_slots / slots_per_hour, resolution,
+        len(forecast), len(prices),
+    )
 
     # 4. Build + solve
     try:
-        model = build_model(forecast, prices, state, params, demand_safety_factor=rt.demand_safety_factor)
+        model = build_model(
+            forecast, prices, state, params,
+            demand_safety_factor=rt.demand_safety_factor,
+            resolution=resolution,
+        )
         result = solve(model, time_limit_s=rt.solver_time_limit_s, mip_gap=rt.solver_mip_gap)
     except SolverInfeasibleError as e:
         logger.error("solver infeasible: %s", e)
@@ -169,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
         state_out=args.state_out,
         dispatch_out=args.dispatch_out,
         cold_start=args.cold_start,
+        prices_source=args.prices_source,
+        resolution=args.resolution,
+        forecast_resolution=args.forecast_resolution,
     )
 
 
