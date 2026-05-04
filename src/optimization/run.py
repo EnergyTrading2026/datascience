@@ -14,15 +14,12 @@ Backtest / replay against a historical SMARD CSV:
 Quarter-hour resolution (requires QH demand forecast and QH-DA-aware backtest):
         --resolution quarterhour
 
-DevOps provides the server/scheduler/storage; the optimizer owns data
-ingestion (live SMARD adapter, forecast load, validation).
-
 Exit codes:
     0 = success, dispatch + state written
     1 = recoverable failure (forecast/price file missing, horizon too short,
-        SMARD API unreachable) — scheduler retries
-    2 = solver infeasible — alert, manual intervention needed
-    3 = unexpected error (incl. SMARD schema break) — page
+        SMARD API unreachable) — caller may retry next cycle
+    2 = solver infeasible — needs investigation
+    3 = unexpected error (incl. SMARD schema break)
 """
 from __future__ import annotations
 
