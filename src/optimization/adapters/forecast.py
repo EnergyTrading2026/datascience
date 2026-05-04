@@ -8,8 +8,8 @@ V1 placeholder schema (REVIEW with forecasting team before relying on this in pr
   - Length: at least the requested horizon, starting at the next slot boundary after at_time
   - No NaN
 
-Validation is strict — schema violations raise loudly so DevOps gets paged
-rather than feeding garbage to the optimizer.
+Validation is strict: schema violations raise loudly rather than feeding
+garbage to the optimizer.
 """
 from __future__ import annotations
 

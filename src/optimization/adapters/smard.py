@@ -7,8 +7,8 @@ Forward visibility from solve time t:
 
 Caller (run.py) reconciles available DA horizon with the demand-forecast horizon.
 
-V1 implementation: CSV file (DevOps fetches separately and writes to a known
-shared path). Live SMARD API is V2 once SCADA integration matures.
+Used for backtest / replay against historical SMARD CSV exports. The
+production fetcher is `smard_live.py`, which pulls live from the SMARD API.
 
 Reference: notebooks/optimization/smard_live_prices.ipynb (validation),
 mpc_prototype.ipynb cell 5 (parser).
@@ -49,8 +49,9 @@ def get_published_prices(at_time: pd.Timestamp, csv_path: Path) -> pd.Series:
     Args:
         at_time: tz-aware Berlin timestamp (current solve time). The first index
             value of the returned series is the smallest hour boundary >= at_time.
-        csv_path: path to SMARD-format CSV file. DevOps keeps this fresh by
-            fetching the latest published auction data periodically.
+        csv_path: path to SMARD-format CSV file (semicolon-separated,
+            comma-decimal, Berlin local). For backtest only — point to a
+            downloaded SMARD export.
 
     Returns:
         pd.Series[float], hourly, tz-aware Europe/Berlin index, name='price_eur_mwh'.

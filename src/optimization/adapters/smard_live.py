@@ -1,8 +1,8 @@
 """SMARD live DA-price adapter — pulls directly from the chart_data JSON API.
 
 The CSV-based `adapters/smard.py` stays in place for backtest (historical bulk
-data lives in a CSV). This adapter is the production fetcher: no DevOps in
-between, just the live SMARD endpoint.
+data lives in a CSV). This adapter is the production fetcher: pulls directly
+from the live SMARD endpoint.
 
 API reference: https://www.smard.de/app/chart_data
 - Filter 4169 = DE/LU day-ahead price (verified to return real
@@ -52,8 +52,8 @@ class SmardLiveError(RuntimeError):
 class SmardApiUnavailableError(SmardLiveError):
     """SMARD endpoint unreachable or returning 5xx after retry exhaustion.
 
-    `run.py` treats this as recoverable (exit 1) — DevOps' scheduler retries
-    the next cycle.
+    `run.py` treats this as recoverable (exit 1); caller may retry the next
+    cycle.
     """
 
 
@@ -61,7 +61,7 @@ class SmardSchemaError(SmardLiveError):
     """SMARD returned 200 but the payload doesn't match the expected schema.
 
     Non-recoverable from the optimizer's perspective — likely an API contract
-    change. `run.py` lets this bubble to exit 3 (page).
+    change. `run.py` lets this bubble to exit 3.
     """
 
 
