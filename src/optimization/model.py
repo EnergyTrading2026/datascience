@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
 
-from optimization.config import PlantParams
-from optimization.state import TIS_LONG, DispatchState
+from src.optimization.config import PlantParams
+from src.optimization.state import TIS_LONG, DispatchState
 
 INT_PER_HOUR = 4  # 15-min grid (model is always 15-min internally)
 

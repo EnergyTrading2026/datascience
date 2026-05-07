@@ -42,7 +42,7 @@ The plan horizon adapts to this — `RuntimeConfig.horizon_hours_target = 35`, `
 3. **Reconcile horizons.** Take the joint length of forecast and prices, clamp to `[horizon_hours_min, horizon_hours_target]`, slice both inputs accordingly. Below the minimum, exit 1.
 4. **Build and solve.** `model.build_model(...)` constructs the MILP from inputs, state, and `PlantParams`. `solve.solve(...)` calls HiGHS via Pyomo with the configured time limit and MIP gap, raising `SolverInfeasibleError` on non-OK termination.
 5. **Extract.** `dispatch.extract_dispatch(...)` reads the first `commit_hours × 4` setpoints into a `Dispatch` dataclass (with per-component cost breakdown). `dispatch.extract_state(...)` reconstructs the carry-over `DispatchState` for the next cycle.
-6. **Persist.** Dispatch is written to parquet at `--dispatch-out`. State is written atomically to `--state-out` (tmp-then-rename) so a partial-write cannot corrupt the next run's input.
+6. **Persist.** Dispatch is written to parquet at `--dispatch-out`. State is written atomically to `--state-out` (tmp-then-rename) so a partial-write cannot corrupt the next run's input. When `--export-out` is provided, a backend-ready JSON payload is also written for container export.
 
 ## Carry-over state
 
@@ -96,6 +96,7 @@ src/optimization/
 ├── solve.py         solve, SolveResult, SolverInfeasibleError — HiGHS via Pyomo
 ├── dispatch.py      Dispatch dataclass, extract_dispatch, extract_state
 ├── run.py           run_one_cycle, CLI entrypoint, exit-code semantics
+├── export_formatter.py backend JSON export schema formatter
 └── adapters/
     ├── __init__.py
     ├── forecast.py  load_forecast, ForecastSchemaError
@@ -116,6 +117,7 @@ python -m optimization.run \
     --state-in     /path/to/state.json \
     --state-out    /path/to/state.json \
     --dispatch-out /path/to/dispatch.parquet \
+    [--export-out  /path/to/backend_export.json] \
     [--cold-start]
 ```
 

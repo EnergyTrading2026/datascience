@@ -6,7 +6,8 @@ Usage (production: live SMARD pull, hourly resolution):
         --forecast-path /shared/forecast/latest.parquet \\
         --state-in     /shared/state/current.json \\
         --state-out    /shared/state/current.json \\
-        --dispatch-out /shared/dispatch/<solve_time>.parquet
+        --dispatch-out /shared/dispatch/<solve_time>.parquet \\
+        --export-out   /shared/export/<solve_time>.json
 
 Backtest / replay against a historical SMARD CSV:
         --prices-source csv --prices-path /shared/smard/latest.csv
@@ -30,15 +31,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyomo.environ as pyo
 
-from optimization.adapters import forecast as forecast_io
-from optimization.adapters import smard as smard_io
-from optimization.adapters import smard_live as smard_live_io
-from optimization.config import PlantParams, RuntimeConfig
-from optimization.dispatch import extract_dispatch, extract_state
-from optimization.model import build_model
-from optimization.solve import SolverInfeasibleError, solve
-from optimization.state import DispatchState
+from src.optimization.adapters import forecast as forecast_io
+from src.optimization.adapters import smard as smard_io
+from src.optimization.adapters import smard_live as smard_live_io
+from src.optimization.config import PlantParams, RuntimeConfig 
+from src.optimization.dispatch import extract_dispatch, extract_state
+from src.optimization.export_formatter import export_to_json, prepare_optimization_export
+from src.optimization.model import build_model
+from src.optimization.solve import SolverInfeasibleError, solve
+from src.optimization.state import DispatchState
 
 logger = logging.getLogger("optimization.run")
 
@@ -92,6 +95,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--state-out", required=True, type=Path)
     p.add_argument("--dispatch-out", required=True, type=Path)
     p.add_argument(
+        "--export-out",
+        type=Path,
+        help="Optional backend API JSON payload path.",
+    )
+    p.add_argument(
         "--cold-start",
         action="store_true",
         help="Ignore --state-in and start with default state (first deployment).",
@@ -118,6 +126,63 @@ def _upsample_hour_to_quarterhour(s: pd.Series) -> pd.Series:
     return pd.Series(np.repeat(s.to_numpy(), INT_PER_HOUR), index=new_idx, name=s.name)
 
 
+def _value(component: object, t: int) -> float:
+    """Return a solved Pyomo scalar value as float."""
+    return float(pyo.value(component[t]))  # type: ignore[index]
+
+
+def _binary(component: object, t: int) -> bool:
+    """Return a solved Pyomo binary variable as bool."""
+    return bool(round(_value(component, t)))
+
+
+def _state_payload(state: DispatchState) -> dict[str, object]:
+    """Map internal DispatchState names to export schema state names."""
+    return {
+        "soc_mwh_th": state.sto_soc_mwh_th,
+        "heat_pump_on": bool(state.hp_on),
+        "boiler_on": bool(state.boiler_on),
+        "chp_on": bool(state.chp_on),
+        "boiler_time_in_state_steps": state.boiler_time_in_state_steps,
+        "chp_time_in_state_steps": state.chp_time_in_state_steps,
+    }
+
+
+def _dispatch_export_frame(
+    model: object,
+    n_intervals: int,
+    commit_start: pd.Timestamp,
+) -> pd.DataFrame:
+    """Build formatter input from solved model values for committed intervals."""
+    idx = pd.date_range(
+        commit_start,
+        periods=n_intervals,
+        freq="15min",
+        tz=commit_start.tz,
+    )
+    rows = []
+    for t in range(1, n_intervals + 1):
+        rows.append(
+            {
+                "demand_th": _value(model.demand, t),
+                "price_el": _value(model.da_price, t),
+                "hp_el_in": _value(model.P_hp_el, t),
+                "hp_th_out": _value(model.Q_hp, t),
+                "boiler_th_out": _value(model.Q_boiler, t),
+                "chp_el_out": _value(model.P_chp_el, t),
+                "chp_th_out": _value(model.Q_chp, t),
+                "storage_charge": _value(model.Q_charge, t),
+                "storage_discharge": _value(model.Q_discharge, t),
+                "storage_soc": _value(model.SoC, t),
+                "heat_slack": 0.0,
+                "hp_on": _binary(model.z_hp, t),
+                "boiler_on": _binary(model.z_boiler, t),
+                "chp_on": _binary(model.z_chp, t),
+            }
+        )
+    return pd.DataFrame(rows, index=idx)
+
+
 def run_one_cycle(
     solve_time: pd.Timestamp,
     forecast_path: Path,
@@ -126,6 +191,7 @@ def run_one_cycle(
     state_out: Path,
     dispatch_out: Path,
     cold_start: bool,
+    export_out: Path | None = None,
     params: PlantParams | None = None,
     runtime: RuntimeConfig | None = None,
     prices_source: str = "live",
@@ -274,10 +340,43 @@ def run_one_cycle(
     commit_end = forecast.index[0] + pd.Timedelta(hours=rt.commit_hours)
     new_state = extract_state(model, t_end=commit_intervals, commit_end_time=commit_end)
 
-    # 6. Persist (atomic for state; parquet for dispatch)
+    # 6. Persist (atomic for state; parquet for dispatch; optional backend JSON)
     dispatch_out.parent.mkdir(parents=True, exist_ok=True)
     dispatch.to_dataframe().to_parquet(dispatch_out)
     new_state.save(state_out)
+    if export_out is not None:
+        export_out.parent.mkdir(parents=True, exist_ok=True)
+        export_df = _dispatch_export_frame(model, commit_intervals, dispatch.commit_start)
+        payload = prepare_optimization_export(
+            dispatch_df=export_df,
+            metadata={
+                "run_id": f"mpc-{solve_time.isoformat()}",
+                "status": result.status,
+                "approach": {
+                    "name": "hourly_mpc_milp",
+                    "solve_horizon_hours": int(model._horizon_hours),
+                    "commit_horizon_hours": rt.commit_hours,
+                    "dt_hours": params.dt_h,
+                },
+                "time_window": {
+                    "start": dispatch.commit_start,
+                    "end": commit_end,
+                    "timezone": str(dispatch.commit_start.tz),
+                },
+                "objective_cost_eur": result.objective_eur,
+                "real_cost_eur": dispatch.expected_cost_eur,
+            },
+            solver_info={
+                "solver": "appsi_highs",
+                "runtime_seconds": result.solve_time_s,
+                "termination_condition": result.status,
+                "status": result.status,
+            },
+            initial_state=_state_payload(state),
+            next_state=_state_payload(new_state),
+        )
+        export_out.write_text(export_to_json(payload, indent=2), encoding="utf-8")
+        logger.info("wrote backend export -> %s", export_out)
     logger.info("wrote dispatch -> %s, state -> %s", dispatch_out, state_out)
     return 0
 
@@ -296,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         state_out=args.state_out,
         dispatch_out=args.dispatch_out,
         cold_start=args.cold_start,
+        export_out=args.export_out,
         prices_source=args.prices_source,
         resolution=args.resolution,
         forecast_resolution=args.forecast_resolution,
