@@ -11,11 +11,20 @@ later.
 
 ## Server requirements
 
-- Linux (any distro Docker supports; tested target: Ubuntu 22.04 / 24.04 LTS).
+- Linux (any distro Docker supports). Image is platform-independent (built
+  and validated on macOS via Docker Desktop); first production deploy is the
+  first real Linux test.
 - Docker Engine ≥ 24 with the Compose v2 plugin (`docker compose`, not
   `docker-compose`).
-- Outbound HTTPS to `https://www.smard.de` (live DA prices).
-- Disk: ~1.2 GB for the image, plus growth in `data/dispatch/` (one parquet
+- Outbound network access:
+    - **Runtime:** HTTPS to `https://www.smard.de` (live DA prices). This is
+      the only outbound endpoint the daemon hits in steady-state operation.
+    - **Build time only** (during `docker compose build` / `up --build`):
+      additionally HTTPS to `ghcr.io` (uv image), `docker.io` /
+      `registry-1.docker.io` (python base image), and `pypi.org` /
+      `files.pythonhosted.org` (Python packages). On firewalled hosts that
+      whitelist outbound traffic, all three must be reachable for the build.
+- Disk: ~1 GB for the image, plus growth in `data/dispatch/` (one parquet
   per hour, ≤ 100 KB each — roughly 0.9 GB/year) and `data/state/` (one JSON
   per hour, ≤ 1 KB each — roughly 9 MB/year).
 - Persistent storage for `data/state/` — must survive restarts.
@@ -74,8 +83,15 @@ Notes:
 ```bash
 docker compose ps                                                   # both services listed
 docker compose logs init-state                                      # ends with exit code 0, "wrote initial state ..."
-docker inspect optimization-mpc --format '{{.State.Health.Status}}' # 'starting' for the first ~15 min, then 'healthy'
+docker inspect optimization-mpc --format '{{.State.Health.Status}}' # typically 'healthy' within seconds — see note below
 ```
+
+The healthcheck reports `healthy` as soon as the first probe finds a fresh
+`state/.heartbeat` file. Because `init-state` seeds the heartbeat before the
+daemon starts, the container usually flips to `healthy` within seconds, not
+after the full 15-minute `start_period`. The 15-minute window only matters as
+a grace period: failing probes during that window do not count against the
+container, so a slow first cycle won't flap the status.
 
 In normal operation, each newly dropped parquet file in
 `/opt/optimization/data/forecast/` triggers one MPC cycle. The container
@@ -132,9 +148,14 @@ Inspect the output:
 
 ```bash
 ls -lt data/dispatch/ | head
-python3 -c "import pandas as pd; print(pd.read_parquet('data/dispatch/<solve_time>.parquet'))"
+docker compose run --rm --no-deps optimization \
+    -c "import pandas as pd; print(pd.read_parquet('/shared/dispatch/<solve_time>.parquet'))"
 readlink data/state/current.json
 ```
+
+(The `docker compose run` form uses the optimizer image, which already has
+pandas + pyarrow, so it works on minimal server images that don't ship
+Python.)
 
 For a longer soak test, the same helper can write one forecast per real hour:
 
@@ -224,8 +245,13 @@ repo's `scripts/` directory on the host; it is not needed by production.
 
 ```bash
 ls -lt /opt/optimization/data/dispatch/ | head
-python3 -c "import pandas as pd; print(pd.read_parquet('/opt/optimization/data/dispatch/<file>.parquet'))"
+docker compose run --rm --no-deps optimization \
+    -c "import pandas as pd; print(pd.read_parquet('/shared/dispatch/<file>.parquet'))"
 ```
+
+The `docker compose run` form runs inside the optimizer image (pandas +
+pyarrow already installed) and uses the in-container path `/shared/dispatch/`.
+No host-side Python required.
 
 ### Trigger a cycle manually (debugging)
 
@@ -233,7 +259,7 @@ The daemon picks up files automatically. To force a cycle for a specific
 solve_time without dropping a forecast file, run a one-off container:
 
 ```bash
-docker compose run --rm optimization \
+docker compose run --rm --no-deps optimization \
     -m optimization.run \
     --solve-time 2026-05-07T13:00:00+00:00 \
     --forecast-path /shared/forecast/2026-05-07T13:00:00Z.parquet \
@@ -241,6 +267,12 @@ docker compose run --rm optimization \
     --state-out    /shared/state/manual-debug.json \
     --dispatch-out /shared/dispatch/manual-debug.parquet
 ```
+
+`--no-deps` is important: without it, `docker compose run optimization`
+also triggers `init-state` (because of `depends_on`). That's harmless —
+`init-state` is idempotent and will exit early if state already exists —
+but it's noise during debugging. With `--no-deps`, only the optimization
+container runs.
 
 This bypasses the symlink update — the manual run won't advance
 `current.json`. Use it to reproduce a failure, not to seed state.
@@ -256,6 +288,16 @@ docker compose up -d --build
 The daemon stops, the image rebuilds, the daemon restarts. State persists
 through the restart (it lives in the bind-mounted `data/` dir, not the
 container).
+
+**Downtime / cycle loss:** the rebuild + restart takes roughly 10–30 seconds
+during which the daemon is not running. If a forecast file lands in
+`data/forecast/` exactly during that window, it will still be picked up
+when the daemon comes back (the scanner picks the newest file on disk).
+But if the forecasting pipeline writes a *newer* file before the daemon
+returns, the older file in the gap is skipped — the daemon only enqueues
+the newest unseen solve_time. To stay on the safe side, do updates well
+inside an hour, not in the last few minutes before the top of the next
+hour.
 
 ## Failure semantics
 
