@@ -99,20 +99,28 @@ In normal operation, each newly dropped parquet file in
 `/opt/optimization/data/forecast/` triggers one MPC cycle. The container
 restarts itself on crashes (`restart: unless-stopped`).
 
-### Smoke test with a synthetic forecast
+### Smoke test with a synthetic forecast (optional)
 
-Use this when the optimization container is up but the real forecasting
-pipeline is not wired in yet, or when you want to validate a fresh server
-deploy end to end.
+This step is **optional**. It validates the full pipeline (forecast → live
+SMARD prices → solve → dispatch + state) on the server before the real
+forecasting service is wired up. If you trust that the forecasting team
+will deliver contract-compliant files and don't need a pre-flight check,
+skip this section — the daemon will simply wait until the first real
+forecast arrives.
 
-This is optional test tooling, not part of production runtime. The optimizer
-container does not need `scripts/sim_forecaster.py`, and the Docker image does
-not include it. In real production, the forecasting service writes the parquet
-files into `data/forecast/`; the synthetic helper is only for manual smoke
-tests from a checked-out repo.
+**Requires:** `uv` on the host (the helper script runs outside the
+container). One-line install:
 
-The helper script writes the same parquet shape that the optimizer expects
-from forecasting:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+(See https://docs.astral.sh/uv/getting-started/installation/ for
+alternatives.) If you don't want a Python toolchain on the server,
+skip the smoke test.
+
+The helper writes the same parquet shape the optimizer expects from
+forecasting:
 
 - file: `data/forecast/<solve_time>.parquet`
 - filename timestamp: UTC with `Z` suffix, e.g. `2026-05-09T10:00:00Z.parquet`
@@ -168,10 +176,21 @@ uv run python scripts/sim_forecaster.py loop \
     --offset-h 1
 ```
 
-If you deploy from a minimal artifact that contains only the Dockerfile,
-Compose file, and source package, you can skip this section entirely. Production
-forecasting remains a separate service that writes contract-compliant parquet
-files into `data/forecast/`.
+#### Cutover to the real forecasting pipeline
+
+Once the smoke test passes, the cutover is a no-op:
+
+- Leftover synthetic forecasts in `data/forecast/` and the resulting test
+  files in `data/state/` and `data/dispatch/` can stay or be deleted.
+  They are harmless: the daemon dedupes by `solve_time`, so an old
+  synthetic forecast for, say, `2026-05-09T10:00:00Z` is ignored once
+  the real pipeline writes a newer file.
+- You'll know the real pipeline is live the moment a `scan: enqueueing
+  forecast ...` line shows up in the daemon logs for a `solve_time` you
+  didn't write yourself.
+- If you want a clean slate before going live, just remove the test
+  files: `rm data/forecast/*.parquet data/dispatch/*.parquet`. State is
+  fine to leave — the next cycle overwrites the relevant fields anyway.
 
 ## What's inside
 
@@ -227,8 +246,49 @@ states stay on disk for audit and rollback.
 docker compose logs -f optimization
 ```
 
-Each cycle logs: detected file, started cycle, solver result, written
-paths. Crashes log a stack trace; the daemon restarts automatically.
+A successful cycle looks roughly like this (timestamps and paths trimmed):
+
+```
+INFO optimization.daemon: scan: enqueueing forecast 2026-05-09T11:00:00+00:00
+INFO optimization.run:    loaded state from /shared/state/current.json (SoC=180.5)
+INFO optimization.run:    hybrid mode: hourly demand forward-filled to 15-min, common start=...
+INFO optimization.run:    horizon=140 slots (35.0h @ quarterhour); forecast=140, prices=140 available
+INFO optimization.run:    solved in 0.78s, status=optimal, objective=12345 EUR
+INFO optimization.run:    wrote dispatch -> /shared/dispatch/...parquet, state -> /shared/state/...json
+INFO optimization.daemon: cycle ok: current.json -> 2026-05-09T11:00:00Z.json
+```
+
+Roughly six lines per cycle, once per hour. On quiet ticks between cycles
+the daemon is silent (the scanner only logs when it actually picks up a
+new file). Crashes log a stack trace; the daemon restarts automatically
+on container exit (`restart: unless-stopped`).
+
+Useful filters:
+
+```bash
+docker compose logs optimization | grep "cycle ok"      # successful cycles
+docker compose logs optimization | grep -iE "error|exception|infeasible"
+```
+
+### Stop, restart, and full takedown
+
+```bash
+# Graceful stop (daemon catches SIGTERM, finishes the in-flight cycle if any):
+docker compose stop optimization
+
+# Restart only the optimization daemon (init-state stays as-is):
+docker compose up -d optimization
+
+# Full takedown — stops AND removes both containers. State and logs in
+# data/ persist; the next `up` re-runs init-state idempotently.
+docker compose down
+```
+
+Maintenance window guidance: a stop costs no data — the daemon resumes from
+the same `data/state/current.json` on next start. A forecast that arrived
+during downtime is still picked up if it is the newest on disk when the
+daemon comes back. See [Updating](#updating) for the same caveat about
+multi-hour windows.
 
 ### Generate a test forecast
 
