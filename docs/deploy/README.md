@@ -25,11 +25,13 @@ later.
       `files.pythonhosted.org` (Python packages). On firewalled hosts that
       whitelist outbound traffic, all three must be reachable for the build.
 - Disk: ~1 GB for the image, plus growth in `data/dispatch/` (one parquet
-  per hour, ≤ 100 KB each — roughly 0.9 GB/year) and `data/state/` (one JSON
-  per hour, ≤ 1 KB each — roughly 9 MB/year).
+  per hour, ~5–10 KB each — roughly 50–100 MB/year) and `data/state/` (one
+  JSON per hour, ~200 B each — roughly 2 MB/year). Both grow linearly and
+  unbounded; no rotation is built in.
 - Persistent storage for `data/state/` — must survive restarts.
-- Time-sync (chrony / systemd-timesyncd). The daemon trusts the system
-  clock to be UTC-aligned.
+- Time-sync (chrony / systemd-timesyncd). The wall clock must be accurate
+  (NTP-synced). The host timezone does not matter — the container forces
+  UTC internally via `TZ=Etc/UTC`.
 
 ## First-time setup
 
@@ -340,12 +342,13 @@ If `data/state/current.json` is corrupt or its target is missing:
 # 1. Stop the daemon
 docker compose stop optimization
 
-# 2. Move the broken symlink target aside (do not delete — diagnostic value)
-cp -a /opt/optimization/data/state/current.json \
-      /opt/optimization/data/state/current.broken.$(date +%s).json
+# 2. Move the broken symlink aside (do not delete — diagnostic value).
+#    `mv` on the symlink itself; the target file (if it still exists) stays
+#    in place under its dated name so it can also be inspected.
+mv /opt/optimization/data/state/current.json \
+   /opt/optimization/data/state/current.broken.$(date +%s)
 
 # 3. Re-seed the synthetic initial state
-rm /opt/optimization/data/state/current.json
 docker compose run --rm init-state
 
 # 4. Restart
