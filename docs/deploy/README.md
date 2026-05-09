@@ -254,9 +254,14 @@ INFO optimization.run:    loaded state from /shared/state/current.json (SoC=180.
 INFO optimization.run:    hybrid mode: hourly demand forward-filled to 15-min, common start=...
 INFO optimization.run:    horizon=140 slots (35.0h @ quarterhour); forecast=140, prices=140 available
 INFO optimization.run:    solved in 0.78s, status=optimal, objective=12345 EUR
-INFO optimization.run:    wrote dispatch -> /shared/dispatch/...parquet, state -> /shared/state/...json
+INFO optimization.run:    wrote dispatch -> /shared/dispatch/...parquet.tmp, state -> /shared/state/...json
 INFO optimization.daemon: cycle ok: current.json -> 2026-05-09T11:00:00Z.json
 ```
+
+Note `dispatch -> ...parquet.tmp` on the second-to-last line: the daemon
+stages the dispatch parquet under a `.tmp` suffix and atomically renames
+it to the final name only after the state symlink is advanced. The final
+file under `data/dispatch/` has no `.tmp` suffix.
 
 Roughly six lines per cycle, once per hour. On quiet ticks between cycles
 the daemon is silent (the scanner only logs when it actually picks up a
@@ -279,8 +284,11 @@ docker compose stop optimization
 # Restart only the optimization daemon (init-state stays as-is):
 docker compose up -d optimization
 
-# Full takedown — stops AND removes both containers. State and logs in
-# data/ persist; the next `up` re-runs init-state idempotently.
+# Full takedown — stops AND removes both containers. State in data/
+# persists. Container logs are dropped with the containers (Docker's
+# json-file log driver stores them per-container, not under data/), so
+# capture anything you need with `docker compose logs` first. The next
+# `up` re-runs init-state idempotently.
 docker compose down
 ```
 
