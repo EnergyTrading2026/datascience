@@ -1,0 +1,48 @@
+# Keep the build context tiny. Anything not listed under COPY in the Dockerfile
+# is irrelevant to the build, but a fat context still slows it down.
+
+# VCS / IDE / OS noise
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+.DS_Store
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Local venvs / build artifacts
+.venv
+venv
+build
+dist
+*.egg-info
+src/datascience.egg-info
+
+# Caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Code that does not belong in the prod optimization image
+notebooks
+tests
+scripts
+src/forecasting
+docs
+
+# Local data / outputs
+data
+out
+shared
+**/*.executed.ipynb
+
+# Docker bits themselves (the Dockerfile is read by the daemon, not the build context)
+Dockerfile
+docker-compose.yml
+.env
+.env.local

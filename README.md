@@ -17,9 +17,15 @@ cd datascience
 pip install -e .
 ```
 
-This installs the optimization stack (`numpy`, `pandas`, `pyomo`, `highspy`).
+This installs the optimization stack (`numpy`, `pandas`, `pyarrow`,
+`matplotlib`, `pyomo`, `highspy`, `apscheduler`). Notebooks
+need `pip install -e '.[notebooks]'` (adds `jupyter`, `ipykernel`).
 Forecasting notebooks pull in additional packages (`scikit-learn`, `statsmodels`,
 `tensorflow`, `pmdarima`, `xgboost`) that you'll need to install separately.
+
+This editable install is the intended setup for local development and tests.
+The intended production path for the optimization service is Docker — see
+`docs/deploy/README.md`.
 
 ## Project Structure
 
@@ -38,6 +44,12 @@ Optimization context lives in `docs/optimization/`: problem statement
 
 - `optimization-backtest` — runs the hourly MPC backtest harness
   (defined in `pyproject.toml`, see `src/optimization/backtest.py`).
+- Dockerized optimization service — see `docs/deploy/README.md` for the
+  production daemon, first-time setup, synthetic forecast smoke test, and
+  operational commands.
+- `scripts/sim_forecaster.py` — local smoke-test helper that writes a
+  contract-shaped forecast parquet into `data/forecast/` so the Docker daemon
+  can run a full optimization cycle without the real forecasting service.
 
 ## Workflow
 

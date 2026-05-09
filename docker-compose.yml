@@ -1,0 +1,79 @@
+# Compose file for the hourly MPC optimizer.
+#
+# First-time setup on a fresh Linux server:
+#     git clone <repo> /opt/optimization
+#     cd /opt/optimization
+#     docker compose up -d --build
+#
+# Updates:
+#     git pull
+#     docker compose up -d --build
+#
+# What runs:
+#     init-state    one-shot, seeds data/state/current.json on first deploy.
+#                   Idempotent: noop if state already exists.
+#     optimization  long-running daemon. Polls data/forecast/ every
+#                   SCAN_INTERVAL_S seconds and triggers one MPC cycle for
+#                   the newest unseen <solve_time>.parquet file. Polling
+#                   (rather than inotify) is intentional: identical behavior
+#                   on Linux and macOS, one mechanism, no platform quirks.
+#
+# Data layout (bind-mounted under ./data):
+#     data/forecast/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (input)
+#     data/state/      current.json + dated history    (persistent)
+#     data/dispatch/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (output)
+
+x-optimization-image: &optimization-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: optimization-mpc:latest
+
+services:
+  init-state:
+    <<: *optimization-image
+    container_name: optimization-init-state
+    restart: "no"
+    command: ["-m", "optimization.init_state", "--state-out", "/shared/state/current.json"]
+    volumes:
+      - ./data/state:/shared/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+  optimization:
+    <<: *optimization-image
+    container_name: optimization-mpc
+    restart: unless-stopped
+    depends_on:
+      init-state:
+        condition: service_completed_successfully
+    environment:
+      TZ: Etc/UTC
+      FORECAST_DIR: /shared/forecast
+      STATE_DIR: /shared/state
+      DISPATCH_DIR: /shared/dispatch
+      PRICES_SOURCE: ${PRICES_SOURCE:-live}
+      RESOLUTION: ${RESOLUTION:-quarterhour}
+      FORECAST_RESOLUTION: ${FORECAST_RESOLUTION:-hour}
+      SCAN_INTERVAL_S: ${SCAN_INTERVAL_S:-2}
+    volumes:
+      - ./data/forecast:/shared/forecast:ro
+      - ./data/state:/shared/state
+      - ./data/dispatch:/shared/dispatch
+    healthcheck:
+      # Heartbeat is seeded during init-state and then bumped by the daemon
+      # after every successful cycle. 5400s = 90 min: well past the hourly
+      # cadence, with margin for one late forecast.
+      test: ["CMD-SHELL", "test -f /shared/state/.heartbeat && test $(($(date +%s) - $(stat -c %Y /shared/state/.heartbeat))) -lt 5400"]
+      interval: 5m
+      timeout: 5s
+      retries: 3
+      start_period: 15m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

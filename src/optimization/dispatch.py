@@ -1,8 +1,8 @@
 """Extract committed dispatch + carry-over state from a solved model.
 
-The committed dispatch is the FIRST `n_intervals` worth of decisions — this
-is what gets sent to SCADA. Everything beyond that is "advisory" and will
-be re-planned in the next hourly solve.
+The committed dispatch is the FIRST `n_intervals` worth of decisions —
+this is what the solver locks in for the current cycle. Everything beyond
+that is "advisory" and will be re-planned in the next hourly solve.
 """
 from __future__ import annotations
 
