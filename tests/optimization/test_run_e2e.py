@@ -6,6 +6,7 @@ Verifies the full chain:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -140,6 +141,7 @@ def test_hybrid_mode_runs_with_mocked_qh_smard(tmp_path, monkeypatch):
 
     state_out = tmp_path / "state.json"
     dispatch_out = tmp_path / "dispatch.parquet"
+    export_out = tmp_path / "export.json"
     rc = run_one_cycle(
         solve_time=solve_time,
         forecast_path=forecast_path,
@@ -147,6 +149,7 @@ def test_hybrid_mode_runs_with_mocked_qh_smard(tmp_path, monkeypatch):
         state_in=None,
         state_out=state_out,
         dispatch_out=dispatch_out,
+        export_out=export_out,
         cold_start=True,
         prices_source="live",
         resolution="quarterhour",
@@ -157,6 +160,12 @@ def test_hybrid_mode_runs_with_mocked_qh_smard(tmp_path, monkeypatch):
     # 1h commit at QH model -> 4 dispatch rows
     assert len(df) == 4
     assert (df.index[1] - df.index[0]) == pd.Timedelta(minutes=15)
+    payload = json.loads(export_out.read_text())
+    assert payload["schema_version"] == "1.0"
+    assert payload["status"] in {"optimal", "feasible"}
+    assert len(payload["dispatch"]) == 4
+    assert payload["dispatch"][0]["heat_pump"]["el_in_mw"] >= 0
+    assert payload["next_initial_state"]["soc_mwh_th"] >= 50.0 - 1e-6
 
 
 def test_hybrid_mode_rejects_inverse_combo(tmp_path):
