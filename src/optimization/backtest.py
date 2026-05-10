@@ -38,11 +38,11 @@ from typing import Callable, Protocol
 
 import pandas as pd
 
-from src.optimization.config import PlantParams, RuntimeConfig
-from src.optimization.dispatch import Dispatch, extract_dispatch, extract_state
-from src.optimization.model import build_model
-from src.optimization.solve import SolverInfeasibleError, solve
-from src.optimization.state import DispatchState
+from optimization.config import PlantParams, RuntimeConfig
+from optimization.dispatch import Dispatch, extract_dispatch, extract_state
+from optimization.model import build_model
+from optimization.solve import SolverInfeasibleError, solve
+from optimization.state import DispatchState
 
 logger = logging.getLogger("optimization.backtest")
 
