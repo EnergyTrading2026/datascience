@@ -12,12 +12,103 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from optimization.adapters import smard_live as smard_live_io
+from optimization import run as run_module
 from optimization.adapters.forecast import DEMAND_COLUMN
 from optimization.run import _upsample_hour_to_quarterhour, run_one_cycle
 from optimization.state import DispatchState
 
 PRICES_CSV = Path("data/optimization/raw/Gro_handelspreise_202403010000_202603020000_Stunde.csv")
+EXPORT_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "run_id",
+    "status",
+    "approach",
+    "time_window",
+    "summary",
+    "dispatch",
+    "next_initial_state",
+    "diagnostics",
+}
+EXPORT_DISPATCH_KEYS = {
+    "timestamp",
+    "step",
+    "demand_mw_th",
+    "price_eur_per_mwh_el",
+    "heat_pump",
+    "boiler",
+    "chp",
+    "storage",
+    "heat_slack_mw_th",
+}
+
+
+def _assert_backend_export_shape(payload: dict[str, object], solve_time: pd.Timestamp) -> None:
+    assert set(payload) == EXPORT_TOP_LEVEL_KEYS
+    assert payload["schema_version"] == "1.0"
+    assert payload["run_id"] == f"mpc-{solve_time.isoformat()}"
+    assert payload["status"] in {"optimal", "feasible"}
+    assert payload["approach"] == {
+        "name": "hourly_mpc_milp",
+        "solve_horizon_hours": 35,
+        "commit_horizon_hours": 1,
+        "dt_hours": 0.25,
+    }
+    assert payload["time_window"] == {
+        "start": solve_time.isoformat(),
+        "end": (solve_time + pd.Timedelta(hours=1)).isoformat(),
+        "timezone": "Europe/Berlin",
+    }
+
+    summary = payload["summary"]
+    assert isinstance(summary, dict)
+    assert set(summary) == {
+        "objective_cost_eur",
+        "real_cost_eur",
+        "runtime_seconds",
+        "solver",
+        "termination_condition",
+    }
+    assert isinstance(summary["objective_cost_eur"], float)
+    assert isinstance(summary["real_cost_eur"], float)
+    assert isinstance(summary["runtime_seconds"], float)
+    assert summary["solver"] == "appsi_highs"
+    assert summary["termination_condition"] in {"optimal", "feasible"}
+
+    dispatch = payload["dispatch"]
+    assert isinstance(dispatch, list)
+    assert len(dispatch) == 4
+    for step, row in enumerate(dispatch):
+        assert set(row) == EXPORT_DISPATCH_KEYS
+        assert row["timestamp"] == (solve_time + pd.Timedelta(minutes=15 * step)).isoformat()
+        assert row["step"] == step
+        assert isinstance(row["demand_mw_th"], float)
+        assert isinstance(row["price_eur_per_mwh_el"], float)
+        assert set(row["heat_pump"]) == {"on", "el_in_mw", "th_out_mw"}
+        assert set(row["boiler"]) == {"on", "th_out_mw"}
+        assert set(row["chp"]) == {"on", "el_out_mw", "th_out_mw"}
+        assert set(row["storage"]) == {"charge_mw_th", "discharge_mw_th", "soc_mwh_th"}
+        assert isinstance(row["heat_pump"]["on"], bool)
+        assert isinstance(row["boiler"]["on"], bool)
+        assert isinstance(row["chp"]["on"], bool)
+
+    next_initial_state = payload["next_initial_state"]
+    assert isinstance(next_initial_state, dict)
+    assert set(next_initial_state) == {
+        "soc_mwh_th",
+        "heat_pump_on",
+        "boiler_on",
+        "chp_on",
+        "boiler_time_in_state_steps",
+        "chp_time_in_state_steps",
+    }
+    assert isinstance(next_initial_state["soc_mwh_th"], float)
+    assert next_initial_state["soc_mwh_th"] >= 50.0 - 1e-6
+    assert isinstance(next_initial_state["heat_pump_on"], bool)
+    assert isinstance(next_initial_state["boiler_on"], bool)
+    assert isinstance(next_initial_state["chp_on"], bool)
+    assert isinstance(next_initial_state["boiler_time_in_state_steps"], int)
+    assert isinstance(next_initial_state["chp_time_in_state_steps"], int)
+    assert payload["diagnostics"] == {"notes": "", "warnings": []}
 
 
 @pytest.mark.skipif(not PRICES_CSV.exists(), reason="SMARD CSV not present in data/")
@@ -137,7 +228,7 @@ def test_hybrid_mode_runs_with_mocked_qh_smard(tmp_path, monkeypatch):
         vals = 60.0 + 20.0 * np.sin(np.arange(len(idx)) * 2 * np.pi / 96)
         return pd.Series(vals, index=idx, name="price_eur_mwh")
 
-    monkeypatch.setattr(smard_live_io, "get_published_prices", fake_get_prices)
+    monkeypatch.setattr(run_module.smard_live_io, "get_published_prices", fake_get_prices)
 
     state_out = tmp_path / "state.json"
     dispatch_out = tmp_path / "dispatch.parquet"
@@ -161,11 +252,8 @@ def test_hybrid_mode_runs_with_mocked_qh_smard(tmp_path, monkeypatch):
     assert len(df) == 4
     assert (df.index[1] - df.index[0]) == pd.Timedelta(minutes=15)
     payload = json.loads(export_out.read_text())
-    assert payload["schema_version"] == "1.0"
-    assert payload["status"] in {"optimal", "feasible"}
-    assert len(payload["dispatch"]) == 4
+    _assert_backend_export_shape(payload, solve_time)
     assert payload["dispatch"][0]["heat_pump"]["el_in_mw"] >= 0
-    assert payload["next_initial_state"]["soc_mwh_th"] >= 50.0 - 1e-6
 
 
 def test_hybrid_mode_rejects_inverse_combo(tmp_path):
