@@ -6,15 +6,6 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_percentage_error
 
-#XGBoost requires Lag-Features
-def create_lags(data):
-    df = data.copy()
-    for lag in range(1, 24 + 1):
-        df[f"lag_{lag}"] = df["value"].shift(lag)
-    #Drop first rows which contain NaN due to shifting
-    df.dropna(inplace=True)
-    return df
-
 #XGBoost for 1h Forecast
 class XGBoost(BaseForecaster):
     def __init__(self):
@@ -32,16 +23,12 @@ class XGBoost(BaseForecaster):
         
     def fit(self, X: pd.DataFrame, y: pd.Series = None):
         """Train the model on the feature set X and target y"""
-        #Create Lag Features
-        X = create_lags(X)
         #Training
         self.model.fit(X,y)
         return self
         
     def predict(self, X: pd.DataFrame) -> pd.Series:
         """Generate predictions based on the feature set X"""
-        #Create Lag Features
-        X = create_lags(X)
         #Predict
         predictions = self.model.predict(X)
         
