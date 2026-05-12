@@ -22,13 +22,16 @@ class MyNewForecaster(BaseForecaster):
         # Add training logic here (e.g., self.model.fit(X, y))
         return self
         
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        """Generate predictions based on the feature set X"""
-        # Add prediction logic here
-        predictions = self.model.predict(X)
+    def predict(self, history: pd.DataFrame, solve_time: pd.Timestamp, horizon: int = 35) -> pd.Series:
+        """Generate forecasts for a specific future horizon."""
+        # Create the exact future datetime index expected by the optimizer
+        future_index = pd.date_range(start=solve_time, periods=horizon, freq='h')
         
-        # Ensure it returns a pandas Series matching the index of X!
-        return pd.Series(predictions, index=X.index)
+        # Add prediction logic here based on historical data up to solve_time
+        predictions_mw = ... # (Make sure your predictions are converted to Megawatts thermal)
+        
+        # Ensure it returns a pandas Series matching the future_index named 'demand_mw_th'
+        return pd.Series(predictions_mw, index=future_index, name='demand_mw_th')
 ```
 
 ## Step 2: Add to the Evaluation Notebook
@@ -53,9 +56,32 @@ To evaluate your new model alongside the baselines, open `notebooks/forecasting/
 
 ### What happens automatically?
 Once you run the notebook loops, your new model will automatically:
-- Be passed the test data to generate predictions.
+- Receive a dynamically split `history` dataset anchored perfectly before your configured `solve_time`.
 - Have its metrics (**MAE, RMSE, MAPE, R²**) calculated dynamically and displayed side-by-side in the comparison dataframes and bar charts.
-- Render on all time-series plot comparisons (1-month, 1-week, and 1-day views).
+- Render accurately on the standard 35-hour forecasting horizon plot.
 
 ### Note on Training (fit)
 If your model requires training, make sure you configure your data splitting and call `model.fit(df_train, y_train)` inside the notebook prediction loop prior to calling `.predict()`.
+
+## Step 3: Add to the Hourly Inference Pipeline
+
+For your new model to be completely accessible to the optimization group via the terminal or scheduler, it needs to be registered.
+
+Open `src/forecasting/run_hourly_forecast.py`. 
+1. Import your model at the top of the file:
+   ```python
+   from forecasting.ml_models import MyNewForecaster
+   ```
+
+2. Add it to the `MODEL_REGISTRY` dictionary:
+   ```python
+   MODEL_REGISTRY = {
+       'daily_naive': DailyNaiveForecaster,
+       'weekly_naive': WeeklyNaiveForecaster,
+       'combined_seasonal': CombinedSeasonalForecaster,
+       'my_custom_model': MyNewForecaster  # <--- Added here
+   }
+   ```
+
+Now you can seamlessly trigger forecasts utilizing your new model directly in the command line!
+`python3 src/forecasting/run_hourly_forecast.py --model my_custom_model`
