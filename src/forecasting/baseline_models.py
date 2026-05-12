@@ -65,9 +65,23 @@ class DailyNaiveForecaster(BaseForecaster):
     def fit(self, X: pd.DataFrame, y: pd.Series = None):
         return self
         
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        # Assuming the standard column target exists
-        return seasonal_naive_daily(X['heat_demand_W'])
+    def predict(self, history: pd.DataFrame, solve_time: pd.Timestamp, horizon: int = 35) -> pd.Series:
+        future_index = pd.date_range(start=solve_time, periods=horizon, freq='h')
+        preds = []
+        
+        # Convert to MW
+        history_mw = history['heat_demand_W'] / 1e6
+        
+        for t in future_index:
+            delta_hours = int((t - solve_time).total_seconds() // 3600)
+            hist_time = solve_time - pd.Timedelta(hours=24 - (delta_hours % 24))
+            
+            if hist_time in history_mw.index:
+                preds.append(history_mw.loc[hist_time])
+            else:
+                preds.append(float(history_mw.mean()) if not history_mw.empty else 0.0)
+                
+        return pd.Series(preds, index=future_index, name='demand_mw_th')
 
 class WeeklyNaiveForecaster(BaseForecaster):
     """
@@ -77,8 +91,23 @@ class WeeklyNaiveForecaster(BaseForecaster):
     def fit(self, X: pd.DataFrame, y: pd.Series = None):
         return self
         
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        return seasonal_naive_weekly(X['heat_demand_W'])
+    def predict(self, history: pd.DataFrame, solve_time: pd.Timestamp, horizon: int = 35) -> pd.Series:
+        future_index = pd.date_range(start=solve_time, periods=horizon, freq='h')
+        preds = []
+        
+        # Convert to MW
+        history_mw = history['heat_demand_W'] / 1e6
+        
+        for t in future_index:
+            delta_hours = int((t - solve_time).total_seconds() // 3600)
+            hist_time = solve_time - pd.Timedelta(hours=168 - (delta_hours % 168))
+            
+            if hist_time in history_mw.index:
+                preds.append(history_mw.loc[hist_time])
+            else:
+                preds.append(float(history_mw.mean()) if not history_mw.empty else 0.0)
+                
+        return pd.Series(preds, index=future_index, name='demand_mw_th')
 
 class CombinedSeasonalForecaster(BaseForecaster):
     """
@@ -88,5 +117,8 @@ class CombinedSeasonalForecaster(BaseForecaster):
     def fit(self, X: pd.DataFrame, y: pd.Series = None):
         return self
         
-    def predict(self, X: pd.DataFrame) -> pd.Series:
-        return combined_seasonal_baseline(X['heat_demand_W'])
+    def predict(self, history: pd.DataFrame, solve_time: pd.Timestamp, horizon: int = 35) -> pd.Series:
+        daily = DailyNaiveForecaster().predict(history, solve_time, horizon)
+        weekly = WeeklyNaiveForecaster().predict(history, solve_time, horizon)
+        
+        return (daily + weekly) / 2.0

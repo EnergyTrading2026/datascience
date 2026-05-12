@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
-from data_cleaning import load_and_clean_data
+from forecasting.data_cleaning import load_and_clean_data
 
 def fill_missing_linear(df: pd.DataFrame, target_col: str = 'heat_demand_W') -> pd.DataFrame:
     """

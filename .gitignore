@@ -232,3 +232,8 @@ data/optimization/*
 # Backtest outputs
 out/
 >>>>>>> cb1d68d (Align data layout with forecasting team conventions)
+
+
+shared/**/*
+!shared/**/
+!shared/**/.gitkeep
