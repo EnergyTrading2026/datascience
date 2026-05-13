@@ -216,11 +216,13 @@ def test_two_hps_with_different_cop_solver_prefers_efficient(constant_inputs):
     A perfectly efficient MILP, given electrical-cost-only objective, must
     saturate the more efficient HP before using the less efficient one
     whenever total demand can be met within p_el_max of the efficient HP.
-    Without storage floor, the cheap-HP path should dominate.
+
+    Storage is removed entirely (not just floor-relaxed) so demand must be
+    met live each step — otherwise a half-full storage would simply drain
+    and both HPs would sit at zero, making the assertion pass vacuously.
     """
     demand, price = constant_inputs
     base = PlantConfig.legacy_default()
-    storages = tuple(replace(s, floor_mwh_th=0.0) for s in base.storages)
     cfg = replace(
         base,
         heat_pumps=(
@@ -229,17 +231,19 @@ def test_two_hps_with_different_cop_solver_prefers_efficient(constant_inputs):
         ),
         boilers=(),  # remove cheaper boiler so HPs actually carry demand
         chps=(),
-        storages=storages,
+        storages=(),  # no buffer: HPs must meet 10 MW thermal every step
     )
     state = DispatchState.cold_start(cfg, demand.index[0])
     m = build_model(demand, price, state, cfg, demand_safety_factor=1.0)
     r = solve(m, time_limit_s=30, mip_gap=0.005)
     assert r.feasible
     d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
-    # Across the commit window, total efficient-HP electrical use must be
-    # >= inefficient-HP use (every step the solver should prefer cheap).
     eff_total = sum(d.hp_p_el_mw["hp_eff"])
     inef_total = sum(d.hp_p_el_mw["hp_inef"])
+    # Sanity: HPs are the only producer, so the efficient one must be ON.
+    # Without this, the >= assertion below could pass with both at zero.
+    assert eff_total > 0, eff_total
+    # Solver should prefer the cheap (high-COP) HP.
     assert eff_total >= inef_total - 1e-6, (eff_total, inef_total)
 
 
@@ -288,11 +292,27 @@ def test_two_chps_with_different_capacities_each_respects_own_bounds(constant_in
     """Two CHPs with very different P_el limits. If a refactor accidentally
     shared params across CHPs, one of these bounds would leak to the other
     and the test would catch it (small CHP exceeding 1.5 MW or big CHP
-    capped at 1.5 MW)."""
-    demand, price = constant_inputs
+    capped at 1.5 MW).
+
+    Scenario forces both CHPs to operate at their electrical maxima:
+      - HPs/boilers/storage removed so CHPs are the only heat source.
+      - Demand 9 MW_th equals the sum of both CHPs' thermal output at
+        max (small: 1.5*1.2 = 1.8; big: 6.0*1.2 = 7.2). The only feasible
+        plan is both at max every step.
+    Under those conditions, a leak of ``chp_big``'s p_el_max (6.0) onto
+    ``chp_small`` would push small to 6.0 MW and trip the upper-bound
+    assertion. The lower assertions ensure the bounds are actually being
+    exercised — without them the test could pass with both CHPs at zero.
+    """
+    demand, _ = constant_inputs
+    idx = demand.index
+    tight_demand = pd.Series(9.0, index=idx, name="demand_mw_th")
+    flat_price = pd.Series(60.0, index=idx, name="price_eur_mwh")
     base = PlantConfig.legacy_default()
     cfg = replace(
         base,
+        heat_pumps=(),
+        boilers=(),
         chps=(
             CHPParams(
                 id="chp_small",
@@ -307,16 +327,21 @@ def test_two_chps_with_different_capacities_each_respects_own_bounds(constant_in
                 min_up_steps=1, min_down_steps=1, startup_cost_eur=0.0,
             ),
         ),
+        storages=(),
     )
-    state = DispatchState.cold_start(cfg, demand.index[0])
-    m = build_model(demand, price, state, cfg, demand_safety_factor=1.0)
+    state = DispatchState.cold_start(cfg, idx[0])
+    m = build_model(tight_demand, flat_price, state, cfg, demand_safety_factor=1.0)
     r = solve(m, time_limit_s=30, mip_gap=0.005)
     assert r.feasible
-    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    d = extract_dispatch(m, n_intervals=4, solve_time=idx[0])
+    # Both CHPs must actually be running near their respective maxes —
+    # otherwise the upper-bound assertions below pass trivially.
+    assert max(d.chp_p_el_mw["chp_small"]) > 1.5 - 0.05, d.chp_p_el_mw["chp_small"]
+    assert max(d.chp_p_el_mw["chp_big"]) > 6.0 - 0.05, d.chp_p_el_mw["chp_big"]
     for v in d.chp_p_el_mw["chp_small"]:
         assert -1e-6 <= v <= 1.5 + 1e-6, ("chp_small leaked bound", v)
     for v in d.chp_p_el_mw["chp_big"]:
-        assert -1e-6 <= v <= 6.0 + 1e-6, ("chp_big bound", v)
+        assert -1e-6 <= v <= 6.0 + 1e-6, ("chp_big leaked bound", v)
 
 
 # ---------------------- Scaling envelope ----------------------
@@ -472,6 +497,15 @@ def test_from_dict_rejects_unknown_field():
     payload = PlantConfig.legacy_default().to_dict()
     payload["heat_pumps"][0]["typo_field"] = 42
     with pytest.raises(ValueError, match="extra="):
+        PlantConfig.from_dict(payload)
+
+
+def test_from_dict_rejects_unknown_top_level_key():
+    """A misspelled top-level key (e.g. ``heat_pumpz``) must fail loud, not
+    silently load as zero heat pumps."""
+    payload = PlantConfig.legacy_default().to_dict()
+    payload["heat_pumpz"] = payload.pop("heat_pumps")
+    with pytest.raises(ValueError, match="unknown top-level keys"):
         PlantConfig.from_dict(payload)
 
 

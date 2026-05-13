@@ -51,7 +51,8 @@ def _bump_heartbeat(state_dir: Path) -> None:
 
 
 def _state_filename(ts: pd.Timestamp) -> str:
-    return f"{ts.tz_convert('UTC').strftime('%Y-%m-%dT%H:%M:%SZ')}.json"
+    # Hyphens in the time portion (not colons) so the filename is Windows-safe.
+    return f"{ts.tz_convert('UTC').strftime('%Y-%m-%dT%H-%M-%SZ')}.json"
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

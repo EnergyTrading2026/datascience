@@ -42,7 +42,7 @@ from optimization.state import DispatchState
 
 logger = logging.getLogger("optimization.daemon")
 
-FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\.parquet$")
+FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\.parquet$")
 HEARTBEAT_NAME = ".heartbeat"
 CURRENT_NAME = "current.json"
 STALE_GRACE_HOURS = 2  # ignore forecasts whose solve_time is older than this
@@ -98,10 +98,22 @@ def _parse_solve_time(filename: str) -> Optional[pd.Timestamp]:
     m = FORECAST_FILENAME_RE.match(filename)
     if not m:
         return None
-    return pd.Timestamp(m.group(1))
+    # Filenames use hyphens in the time portion (e.g. 2026-05-13T14-00-00Z)
+    # because Windows rejects ':' in paths. Restore the ISO form for pandas.
+    date_part, time_part = m.group(1).split("T", 1)
+    iso = f"{date_part}T{time_part[:2]}:{time_part[3:5]}:{time_part[6:8]}Z"
+    return pd.Timestamp(iso)
 
 
-def _scan_newest_forecast(forecast_dir: Path) -> Optional[pd.Timestamp]:
+def _scan_newest_forecast(
+    forecast_dir: Path,
+    max_solve_time: Optional[pd.Timestamp] = None,
+) -> Optional[pd.Timestamp]:
+    """Newest parseable forecast filename, optionally capped at ``max_solve_time``.
+
+    The cap exists so a single implausibly-future filename (e.g. clock-skewed
+    upstream writer) cannot mask all legitimate forecasts in the same directory.
+    """
     if not forecast_dir.is_dir():
         return None
     candidates: list[pd.Timestamp] = []
@@ -109,8 +121,11 @@ def _scan_newest_forecast(forecast_dir: Path) -> Optional[pd.Timestamp]:
         if not entry.is_file():
             continue
         ts = _parse_solve_time(entry.name)
-        if ts is not None:
-            candidates.append(ts)
+        if ts is None:
+            continue
+        if max_solve_time is not None and ts > max_solve_time:
+            continue
+        candidates.append(ts)
     return max(candidates) if candidates else None
 
 
@@ -169,8 +184,8 @@ def _run_one(
     daemon honors the operator's plant configuration instead of silently using
     the legacy default.
     """
-    fname = f"{solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet"
-    state_fname = f"{solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.json"
+    fname = f"{solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet"
+    state_fname = f"{solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.json"
     forecast_path = cfg.forecast_dir / fname
     dispatch_path = cfg.dispatch_dir / fname
     dispatch_tmp = dispatch_path.with_suffix(dispatch_path.suffix + ".tmp")
@@ -288,7 +303,13 @@ def _scan(
     Idempotent on quiet ticks: returns silently if nothing has changed since
     the last enqueue. Logs only when a new file is actually picked up.
     """
-    newest = _scan_newest_forecast(cfg.forecast_dir)
+    # Cap the candidate set to plausibly-current filenames. A single
+    # bogus far-future file otherwise wins ``max()`` against every legitimate
+    # forecast in the same directory — and advancing the watermark to that
+    # timestamp would then filter out everything real that follows.
+    now = pd.Timestamp.now(tz="UTC")
+    max_ts = now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS)
+    newest = _scan_newest_forecast(cfg.forecast_dir, max_solve_time=max_ts)
     if newest is None:
         return
     last_solve_time = _read_last_solve_time(cfg.state_dir)

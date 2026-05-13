@@ -274,6 +274,10 @@ class PlantConfig:
         and per-asset shape; physical bounds are enforced by each dataclass'
         ``__post_init__``.
         """
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"plant config must be a JSON object, got {type(payload).__name__}"
+            )
         version = payload.get("schema_version")
         if version is None:
             raise ValueError(
@@ -284,6 +288,14 @@ class PlantConfig:
             raise ValueError(
                 f"plant config schema_version={version}, expected "
                 f"{CONFIG_SCHEMA_VERSION}. No migration available."
+            )
+        # Reject unknown top-level keys so e.g. ``heat_pumpz`` doesn't silently
+        # load as zero heat pumps. Mirrors the per-asset _check_keys guard.
+        extra = set(payload) - _TOP_LEVEL_FIELDS
+        if extra:
+            raise ValueError(
+                f"plant config has unknown top-level keys: {sorted(extra)}. "
+                f"Expected: {sorted(_TOP_LEVEL_FIELDS)}"
             )
         try:
             return cls(
@@ -326,6 +338,11 @@ class PlantConfig:
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
+_TOP_LEVEL_FIELDS = {
+    "schema_version", "dt_h", "gas_price_eur_mwh_hs",
+    "co2_factor_t_per_mwh_hs", "co2_price_eur_per_t",
+    "heat_pumps", "boilers", "chps", "storages",
+}
 _HP_FIELDS = {"id", "p_el_min_mw", "p_el_max_mw", "cop"}
 _BOILER_FIELDS = {"id", "q_min_mw_th", "q_max_mw_th", "eff", "min_up_steps", "min_down_steps"}
 _CHP_FIELDS = {

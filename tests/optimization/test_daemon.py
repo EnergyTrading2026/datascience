@@ -53,7 +53,7 @@ def test_scan_enqueues_next_hour_after_previous_success(tmp_path):
     last_solve_time = pd.Timestamp.now(tz="UTC").floor("h")
     next_solve_time = last_solve_time + pd.Timedelta(hours=1)
     _cs(next_solve_time).save(state_dir / "current.json")
-    (forecast_dir / f"{next_solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet").write_text("")
+    (forecast_dir / f"{next_solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
 
     cfg = daemon.DaemonConfig(
         forecast_dir=forecast_dir,
@@ -86,7 +86,7 @@ def test_scan_does_not_re_enqueue_same_solve_time(tmp_path):
     # No state on disk yet — _read_last_solve_time returns None — so dedupe
     # has to rely on _ScanState.last_enqueued. This mirrors the in-flight
     # case: cycle running, last_solve_time not yet advanced.
-    (forecast_dir / f"{solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet").write_text("")
+    (forecast_dir / f"{solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
 
     cfg = daemon.DaemonConfig(
         forecast_dir=forecast_dir,
@@ -116,6 +116,51 @@ def test_should_run_rejects_implausibly_future_forecast(tmp_path):
     )
 
     assert daemon._should_run(cfg, solve_time, last_solve_time=None) is False
+
+
+def test_scan_does_not_advance_watermark_for_future_forecast(tmp_path):
+    """A bogus far-future forecast must not poison the scanner watermark.
+
+    Regression: previously _scan advanced ``last_enqueued`` before the worker
+    validated timestamps. A 2099-dated file became the eternal "newest", and
+    every legitimate forecast afterwards was filtered out as "already seen".
+    """
+    forecast_dir = tmp_path / "forecast"
+    state_dir = tmp_path / "state"
+    dispatch_dir = tmp_path / "dispatch"
+    forecast_dir.mkdir()
+    state_dir.mkdir()
+    dispatch_dir.mkdir()
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    bogus = now + pd.Timedelta(hours=daemon.MAX_FUTURE_SKEW_HOURS + 24)
+    legit = now + pd.Timedelta(hours=1)
+    (forecast_dir / f"{bogus.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
+
+    cfg = daemon.DaemonConfig(
+        forecast_dir=forecast_dir,
+        state_dir=state_dir,
+        dispatch_dir=dispatch_dir,
+        prices_source="live",
+        prices_path=None,
+        resolution="quarterhour",
+        forecast_resolution="hour",
+        scan_interval_s=2,
+    )
+    work_queue: "queue.Queue[object]" = queue.Queue()
+    scan_state = daemon._ScanState()
+
+    daemon._scan(cfg, work_queue, scan_state)
+
+    assert work_queue.empty()
+    assert scan_state.last_enqueued is None
+
+    # A legitimate forecast arriving afterwards must still be picked up.
+    (forecast_dir / f"{legit.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
+    daemon._scan(cfg, work_queue, scan_state)
+
+    assert work_queue.get_nowait() == legit
+    assert scan_state.last_enqueued == legit
 
 
 def test_read_last_solve_time_treats_partial_state_as_missing(tmp_path):
@@ -165,14 +210,14 @@ def test_run_one_stages_dispatch_until_state_commit(tmp_path, monkeypatch):
 
     rc = daemon._run_one(cfg, solve_time)
 
-    final_dispatch = dispatch_dir / "2026-05-07T13:00:00Z.parquet"
+    final_dispatch = dispatch_dir / "2026-05-07T13-00-00Z.parquet"
     staged_dispatch = final_dispatch.with_suffix(".parquet.tmp")
     assert rc == 0
     assert seen["dispatch_out"] == staged_dispatch
     assert final_dispatch.exists()
     assert not staged_dispatch.exists()
     assert current.is_symlink()
-    assert current.resolve().name == "2026-05-07T13:00:00Z.json"
+    assert current.resolve().name == "2026-05-07T13-00-00Z.json"
 
 
 def test_run_one_publishes_dispatch_before_advancing_state(tmp_path, monkeypatch):
@@ -216,7 +261,7 @@ def test_run_one_publishes_dispatch_before_advancing_state(tmp_path, monkeypatch
     rc = daemon._run_one(cfg, solve_time)
 
     assert rc == 0
-    dispatch_path = dispatch_dir / "2026-05-07T13:00:00Z.parquet"
+    dispatch_path = dispatch_dir / "2026-05-07T13-00-00Z.parquet"
     current_tmp = current.with_suffix(current.suffix + ".tmp")
     assert replace_calls[-2:] == [
         (dispatch_path.with_suffix(".parquet.tmp"), dispatch_path),
@@ -262,9 +307,9 @@ def test_run_one_cleans_up_staged_outputs_after_crash(tmp_path, monkeypatch):
     else:
         raise AssertionError("expected _run_one to re-raise the crash")
 
-    assert not (dispatch_dir / "2026-05-07T13:00:00Z.parquet").exists()
-    assert not (dispatch_dir / "2026-05-07T13:00:00Z.parquet.tmp").exists()
-    assert not (state_dir / "2026-05-07T13:00:00Z.json").exists()
+    assert not (dispatch_dir / "2026-05-07T13-00-00Z.parquet").exists()
+    assert not (dispatch_dir / "2026-05-07T13-00-00Z.parquet.tmp").exists()
+    assert not (state_dir / "2026-05-07T13-00-00Z.json").exists()
     assert DispatchState.load(current).timestamp == solve_time
 
 
@@ -276,7 +321,7 @@ def test_init_state_writes_symlink_and_heartbeat(tmp_path):
 
     assert rc == 0
     assert state_out.is_symlink()
-    assert state_out.resolve().name == "2026-05-07T13:00:00Z.json"
+    assert state_out.resolve().name == "2026-05-07T13-00-00Z.json"
     assert DispatchState.load(state_out).timestamp == pd.Timestamp(ts)
     assert (state_out.parent / ".heartbeat").exists()
 
