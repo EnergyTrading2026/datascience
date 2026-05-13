@@ -2,6 +2,8 @@
 
 > **Note:** This document defines the MILP formulation (decision variables, constraints, objective, parameters). The production system runs an hourly MPC variant of this problem — see [`hourly_mpc.md`](hourly_mpc.md) for the architecture, rolling-horizon mechanics, and orchestration. Where the two documents disagree on horizon length or rolling-horizon cadence, `hourly_mpc.md` is current.
 
+> **Plant config (since `feat/modular-assets`):** The numeric values listed below describe the *legacy* 1-of-each plant. They live in code as `PlantConfig.legacy_default()` (`src/optimization/config.py`) and are the default when no `--config-file` is passed. Per-asset modularity is enabled in code: a plant may carry 0..N of each family (heat pumps, boilers, CHPs, storages), each with its own `id` and physics. Runtime input is `plant_config.json`, generated via `optimization-write-default-config <path>` and then hand-edited by the operator. The MILP formulation below generalizes to multi-asset by indexing every variable and constraint over the per-family asset set.
+
 MILP for 24 h dispatch of Heat Pump, Condensing Boiler, CHP, and Thermal Storage against day-ahead (DA) electricity prices. Minimizes gas + CO2 + electricity cost net of CHP electricity revenue.
 
 ## Time Structure

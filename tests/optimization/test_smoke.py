@@ -15,28 +15,28 @@ import pytest
 
 from optimization.model import build_model
 from optimization.solve import SolverInfeasibleError, solve
-from optimization.state import TIS_LONG, DispatchState
+from optimization.state import TIS_LONG, DispatchState, StorageState, UnitState
 
 
-def test_solves_constant_demand_matches_notebook(constant_inputs_35h, cold_state, params_no_floor):
+def test_solves_constant_demand_matches_notebook(constant_inputs_35h, cold_state, config_no_floor):
     demand, price = constant_inputs_35h
-    model = build_model(demand, price, cold_state, params_no_floor, demand_safety_factor=1.0)
+    model = build_model(demand, price, cold_state, config_no_floor, demand_safety_factor=1.0)
     result = solve(model, time_limit_s=30, mip_gap=0.005)
     assert result.feasible
     # Notebook reference: 2571.7 EUR. Allow ±0.5% tolerance for MIP-gap noise.
     assert result.objective_eur == pytest.approx(2571.7, rel=0.005)
 
 
-def test_solves_with_hard_floor_feasible(constant_inputs_35h, cold_state, params):
-    """Default params (floor=50) should also be feasible on the same inputs.
+def test_solves_with_hard_floor_feasible(constant_inputs_35h, cold_state, config):
+    """Default config (floor=50) should also be feasible on the same inputs.
     Cost is expected to differ from no-floor (storage less freedom)."""
     demand, price = constant_inputs_35h
-    model = build_model(demand, price, cold_state, params, demand_safety_factor=1.0)
+    model = build_model(demand, price, cold_state, config, demand_safety_factor=1.0)
     result = solve(model, time_limit_s=30, mip_gap=0.005)
     assert result.feasible
 
 
-def test_solve_raises_on_infeasible_model(params):
+def test_solve_raises_on_infeasible_model(config):
     """Regression for the Pyomo-HiGHS no-feasible-solution path.
 
     When HiGHS terminates without an incumbent, Pyomo's appsi wrapper raises
@@ -52,15 +52,16 @@ def test_solve_raises_on_infeasible_model(params):
     demand = pd.Series(1.5, index=idx, name="demand_mw_th")
     price = pd.Series(50.0, index=idx, name="price_eur_mwh")
 
+    storage = config.storages[0]
     state = DispatchState(
         timestamp=idx[0],
-        sto_soc_mwh_th=params.sto_capacity_mwh_th,
-        hp_on=0,
-        boiler_on=1,
-        boiler_time_in_state_steps=1,
-        chp_on=0,
-        chp_time_in_state_steps=TIS_LONG,
+        units={
+            "hp": UnitState(on=0, time_in_state_steps=TIS_LONG),
+            "boiler": UnitState(on=1, time_in_state_steps=1),
+            "chp": UnitState(on=0, time_in_state_steps=TIS_LONG),
+        },
+        storages={storage.id: StorageState(soc_mwh_th=storage.capacity_mwh_th)},
     )
-    model = build_model(demand, price, state, params)
+    model = build_model(demand, price, state, config)
     with pytest.raises(SolverInfeasibleError):
         solve(model)

@@ -36,7 +36,7 @@ import pyomo.environ as pyo
 from optimization.adapters import forecast as forecast_io
 from optimization.adapters import smard as smard_io
 from optimization.adapters import smard_live as smard_live_io
-from optimization.config import PlantParams, RuntimeConfig
+from optimization.config import PlantConfig, RuntimeConfig
 from optimization.dispatch import extract_dispatch, extract_state
 from optimization.export_formatter import export_to_json, prepare_optimization_export
 from optimization.model import build_model
@@ -104,6 +104,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Ignore --state-in and start with default state (first deployment).",
     )
+    p.add_argument(
+        "--config-file",
+        type=Path,
+        default=None,
+        help="Path to plant_config.json. Defaults to PlantConfig.legacy_default() "
+             "baked in code if omitted.",
+    )
     return p.parse_args(argv)
 
 
@@ -126,61 +133,103 @@ def _upsample_hour_to_quarterhour(s: pd.Series) -> pd.Series:
     return pd.Series(np.repeat(s.to_numpy(), INT_PER_HOUR), index=new_idx, name=s.name)
 
 
-def _value(component: object, t: int) -> float:
-    """Return a solved Pyomo scalar value as float."""
+def _v(component: object, asset_id: str, t: int) -> float:
+    """Return a solved Pyomo (asset_id, t)-indexed scalar value as float."""
+    return float(pyo.value(component[asset_id, t]))  # type: ignore[index]
+
+
+def _b(component: object, asset_id: str, t: int) -> bool:
+    """Return a solved Pyomo (asset_id, t)-indexed binary variable as bool."""
+    return bool(round(_v(component, asset_id, t)))
+
+
+def _value_scalar(component: object, t: int) -> float:
+    """Return a solved Pyomo scalar (t-indexed only) value as float."""
     return float(pyo.value(component[t]))  # type: ignore[index]
 
 
-def _binary(component: object, t: int) -> bool:
-    """Return a solved Pyomo binary variable as bool."""
-    return bool(round(_value(component, t)))
-
-
 def _state_payload(state: DispatchState) -> dict[str, object]:
-    """Map internal DispatchState names to export schema state names."""
+    """Serialize DispatchState into the v2.0 ``{units, storages}`` shape.
+
+    Mirrors the on-disk DispatchState format so the application repo can
+    deserialize directly. ``units`` covers HP/boiler/CHP keyed by asset id;
+    ``storages`` keeps SoC per storage id.
+    """
     return {
-        "soc_mwh_th": state.sto_soc_mwh_th,
-        "heat_pump_on": bool(state.hp_on),
-        "boiler_on": bool(state.boiler_on),
-        "chp_on": bool(state.chp_on),
-        "boiler_time_in_state_steps": state.boiler_time_in_state_steps,
-        "chp_time_in_state_steps": state.chp_time_in_state_steps,
+        "units": {
+            asset_id: {
+                "on": bool(unit.on),
+                "time_in_state_steps": int(unit.time_in_state_steps),
+            }
+            for asset_id, unit in state.units.items()
+        },
+        "storages": {
+            storage_id: {"soc_mwh_th": float(s.soc_mwh_th)}
+            for storage_id, s in state.storages.items()
+        },
     }
 
 
-def _dispatch_export_frame(
+def _dispatch_records(
     model: object,
+    config: PlantConfig,
     n_intervals: int,
     commit_start: pd.Timestamp,
-) -> pd.DataFrame:
-    """Build formatter input from solved model values for committed intervals."""
-    idx = pd.date_range(
-        commit_start,
-        periods=n_intervals,
-        freq="15min",
-        tz=commit_start.tz,
-    )
-    rows = []
+) -> list[dict[str, object]]:
+    """Build v2.0 per-step dispatch records from a solved Pyomo model.
+
+    Each record carries one entry per asset in each family (arrays). With a
+    legacy single-asset config the arrays each hold one element; with N>1
+    the solver decisions are surfaced per asset id so downstream consumers
+    keep per-unit visibility.
+    """
+    records: list[dict[str, object]] = []
     for t in range(1, n_intervals + 1):
-        rows.append(
-            {
-                "demand_th": _value(model.demand, t),
-                "price_el": _value(model.da_price, t),
-                "hp_el_in": _value(model.P_hp_el, t),
-                "hp_th_out": _value(model.Q_hp, t),
-                "boiler_th_out": _value(model.Q_boiler, t),
-                "chp_el_out": _value(model.P_chp_el, t),
-                "chp_th_out": _value(model.Q_chp, t),
-                "storage_charge": _value(model.Q_charge, t),
-                "storage_discharge": _value(model.Q_discharge, t),
-                "storage_soc": _value(model.SoC, t),
-                "heat_slack": 0.0,
-                "hp_on": _binary(model.z_hp, t),
-                "boiler_on": _binary(model.z_boiler, t),
-                "chp_on": _binary(model.z_chp, t),
-            }
-        )
-    return pd.DataFrame(rows, index=idx)
+        ts = (commit_start + (t - 1) * pd.Timedelta(minutes=15)).isoformat()
+        record: dict[str, object] = {
+            "timestamp": ts,
+            "step": t - 1,
+            "demand_mw_th": _value_scalar(model.demand, t),
+            "price_eur_per_mwh_el": _value_scalar(model.da_price, t),
+            "heat_pumps": [
+                {
+                    "id": hp.id,
+                    "on": _b(model.z_hp, hp.id, t),
+                    "el_in_mw": _v(model.P_hp_el, hp.id, t),
+                    "th_out_mw": _v(model.Q_hp, hp.id, t),
+                }
+                for hp in config.heat_pumps
+            ],
+            "boilers": [
+                {
+                    "id": b.id,
+                    "on": _b(model.z_boiler, b.id, t),
+                    "th_out_mw": _v(model.Q_boiler, b.id, t),
+                }
+                for b in config.boilers
+            ],
+            "chps": [
+                {
+                    "id": c.id,
+                    "on": _b(model.z_chp, c.id, t),
+                    "el_out_mw": _v(model.P_chp_el, c.id, t),
+                    "th_out_mw": _v(model.Q_chp, c.id, t),
+                }
+                for c in config.chps
+            ],
+            "storages": [
+                {
+                    "id": s.id,
+                    "charge_mw_th": _v(model.Q_charge, s.id, t),
+                    "discharge_mw_th": _v(model.Q_discharge, s.id, t),
+                    "soc_mwh_th": _v(model.SoC, s.id, t),
+                }
+                for s in config.storages
+            ],
+            "heat_slack_mw_th": 0.0,
+        }
+        records.append(record)
+    return records
 
 
 def run_one_cycle(
@@ -191,8 +240,8 @@ def run_one_cycle(
     state_out: Path,
     dispatch_out: Path,
     cold_start: bool,
+    config: PlantConfig | None = None,
     export_out: Path | None = None,
-    params: PlantParams | None = None,
     runtime: RuntimeConfig | None = None,
     prices_source: str = "live",
     resolution: str = "quarterhour",
@@ -245,15 +294,16 @@ def run_one_cycle(
         )
         return 1
 
-    params = params or PlantParams()
+    config = config or PlantConfig.legacy_default()
     rt = runtime or RuntimeConfig()
     slots_per_hour = _SLOTS_PER_HOUR[resolution]
     hybrid_mode = forecast_resolution != resolution
 
     # 1. Load state
     if cold_start:
-        state = DispatchState.cold_start(solve_time)
-        logger.info("cold start: SoC=%.1f, all units off", state.sto_soc_mwh_th)
+        state = DispatchState.cold_start(config, solve_time)
+        total_soc = sum(s.soc_mwh_th for s in state.storages.values())
+        logger.info("cold start: total SoC=%.1f, all units off", total_soc)
     else:
         if state_in is None:
             logger.error("--state-in required when not --cold-start")
@@ -263,7 +313,8 @@ def run_one_cycle(
         except FileNotFoundError as e:
             logger.error("state file missing: %s", e)
             return 1
-        logger.info("loaded state from %s (SoC=%.1f)", state_in, state.sto_soc_mwh_th)
+        total_soc = sum(s.soc_mwh_th for s in state.storages.values())
+        logger.info("loaded state from %s (total SoC=%.1f)", state_in, total_soc)
 
     # 2. Fetch inputs
     try:
@@ -321,7 +372,7 @@ def run_one_cycle(
     # 4. Build + solve
     try:
         model = build_model(
-            forecast, prices, state, params,
+            forecast, prices, state, config,
             demand_safety_factor=rt.demand_safety_factor,
             resolution=resolution,
         )
@@ -346,9 +397,11 @@ def run_one_cycle(
     new_state.save(state_out)
     if export_out is not None:
         export_out.parent.mkdir(parents=True, exist_ok=True)
-        export_df = _dispatch_export_frame(model, commit_intervals, dispatch.commit_start)
+        records = _dispatch_records(
+            model, config, commit_intervals, dispatch.commit_start
+        )
         payload = prepare_optimization_export(
-            dispatch_df=export_df,
+            dispatch_records=records,
             metadata={
                 "run_id": f"mpc-{solve_time.isoformat()}",
                 "status": result.status,
@@ -356,7 +409,7 @@ def run_one_cycle(
                     "name": "hourly_mpc_milp",
                     "solve_horizon_hours": int(model._horizon_hours),
                     "commit_horizon_hours": rt.commit_hours,
-                    "dt_hours": params.dt_h,
+                    "dt_hours": config.dt_h,
                 },
                 "time_window": {
                     "start": dispatch.commit_start,
@@ -387,6 +440,15 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.config_file is not None:
+        try:
+            config = PlantConfig.from_json(args.config_file)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error("config load failed (%s): %s", args.config_file, e)
+            return 1
+        logger.info("loaded plant config from %s", args.config_file)
+    else:
+        config = None  # run_one_cycle defaults to legacy_default()
     return run_one_cycle(
         solve_time=args.solve_time,
         forecast_path=args.forecast_path,
@@ -395,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         state_out=args.state_out,
         dispatch_out=args.dispatch_out,
         cold_start=args.cold_start,
+        config=config,
         export_out=args.export_out,
         prices_source=args.prices_source,
         resolution=args.resolution,

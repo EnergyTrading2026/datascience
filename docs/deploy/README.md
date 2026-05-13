@@ -38,10 +38,10 @@ later.
 ### Host directory ownership (read this first)
 
 The container runs as a non-root user with **uid 1000 / gid 1000**. The
-`data/forecast`, `data/state`, and `data/dispatch` directories are bind-mounted
-into the container, so the host-side permissions are what the daemon actually
-sees — the `chown` baked into the image is overridden by the bind mount and
-does not help here.
+`data/forecast`, `data/state`, `data/dispatch`, and `data/config` directories
+are bind-mounted into the container, so the host-side permissions are what
+the daemon actually sees — the `chown` baked into the image is overridden by
+the bind mount and does not help here.
 
 The daemon must be able to:
 
@@ -50,6 +50,8 @@ The daemon must be able to:
 - read and write `data/state/` (state JSON, dated history, heartbeat, atomic
   symlink)
 - write `data/dispatch/` (one parquet per cycle)
+- read `data/config/` (optional `plant_config.json` for multi-asset
+  deployments; only needed when `CONFIG_FILE` is set)
 
 If these directories are owned by `root` (which happens when Docker
 auto-creates them or when an operator runs `sudo mkdir`) or by a uid other
@@ -61,7 +63,7 @@ and chown them to uid 1000 before the first `docker compose up`:
 ```bash
 git clone <repo-url> /opt/optimization
 cd /opt/optimization
-mkdir -p data/forecast data/state data/dispatch
+mkdir -p data/forecast data/state data/dispatch data/config
 sudo chown -R 1000:1000 data/
 docker compose up -d --build
 ```
@@ -237,6 +239,81 @@ data/
 
 State is append-only with a moving symlink from the very first deploy. Past
 states stay on disk for audit and rollback.
+
+## Plant config (modular assets)
+
+The optimizer ships with `PlantConfig.legacy_default()` baked in — a single
+heat pump, condensing boiler, CHP, and storage with the parameters listed in
+[`optimization_problem.md`](../optimization/optimization_problem.md). For the
+default plant **no `plant_config.json` is needed**; `optimization-backtest`,
+`optimization.run`, and the daemon all use the legacy default when no plant
+config is provided.
+
+To deploy with a different plant (extra assets, different limits), drop a
+`plant_config.json` into `./data/config/` and set `CONFIG_FILE` to its
+in-container path. Both the `init-state` service (cold-starts a matching
+state file) and the long-running `optimization` daemon read the same env
+var, so the IDs stay in sync.
+
+```bash
+# 1. Generate a starter config on the host, then edit it
+optimization-write-default-config /opt/optimization/data/config/plant_config.json
+# edit the file (add/remove HPs, boilers, CHPs, storages; tweak limits)
+
+# 2. Set CONFIG_FILE in /opt/optimization/.env (compose picks this up):
+echo 'CONFIG_FILE=/shared/config/plant_config.json' >> /opt/optimization/.env
+
+# 3. Make sure ./data/config/ is readable by uid 1000 (same uid the
+#    container runs as; see "Host directory ownership" above):
+sudo chown -R 1000:1000 /opt/optimization/data/config
+
+# 4. Bring the stack up. init-state seeds a state file whose asset IDs
+#    match the config; the daemon then runs every cycle under that config.
+docker compose up -d --build
+```
+
+For ad-hoc runs outside compose, the same path can be passed directly:
+`docker run ... -e CONFIG_FILE=/shared/config/plant_config.json -v ./data/config:/shared/config:ro ...`.
+
+The daemon reads `CONFIG_FILE` once at startup and uses that PlantConfig for
+every cycle. Editing the file mid-run has no effect until the daemon is
+restarted — by design, so a half-edited config can never reach the solver.
+
+`init-state --config-file` cold-starts a state file whose asset IDs match
+the plant config exactly. Without it, seed mode falls back to
+`PlantConfig.legacy_default()` (1 HP + 1 boiler + 1 CHP + 1 storage), and
+the daemon's first cycle would crash with a "state/config mismatch" error.
+
+`optimization.run` (the one-shot CLI used outside the daemon) also accepts
+`--config-file <path>` for the same purpose, and `optimization-backtest`
+takes the same flag.
+
+The file is plain JSON with a `schema_version` field (currently `1`); each
+asset is identified by a globally unique string `id` that also appears in
+the state file. If `plant_config.json` changes after the initial seed,
+re-seed `data/state/current.json` against the new config:
+`optimization-init-state --state-out data/state/current.json --force
+--config-file data/config/plant_config.json`. The daemon's `covers()`
+check refuses to start on config/state drift, so a forgotten re-seed is
+caught loud rather than silently mis-dispatched.
+
+## Output schemas
+
+- **`dispatch_log.parquet` and per-cycle dispatch files** are long-format:
+  columns are `asset_id`, `family`, `quantity`, `value`; the DatetimeIndex
+  is non-unique (one row per (timestamp, asset, quantity)). Aggregate per
+  asset by grouping on `(family, quantity)`.
+- **`summary.json`** contains a `config` block (per-asset lists) and a
+  `summary` block with aggregate KPIs. **`records.parquet`** has
+  `boilers_on_count_end` / `chps_on_count_end` / `hps_on_count_end`
+  columns: counts of units of each family on at cycle end (0..N).
+
+## Dev-env note: pyomo / highspy pins
+
+`pyproject.toml` pins `pyomo~=6.10.0` and `highspy==1.14.0`. The pins exist
+so the regression pin (`tests/optimization/test_regression_pin.py`) stays
+bit-identical against HiGHS branching changes. Bump deliberately and
+re-run the pin if you do.
 
 ## Operations
 

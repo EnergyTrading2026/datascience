@@ -8,8 +8,18 @@ dependencies = [
     "pandas",
     "pyarrow",
     "matplotlib",
-    "pyomo",
-    "highspy",
+    # pyomo + highspy versions are pinned because tests/optimization/
+    # test_regression_pin.py asserts bit-identical objective and dispatch
+    # against the pre-modular-assets MILP. Variable ordering and HiGHS
+    # branching heuristics can shift across releases (including patch
+    # releases for highspy, where branching tweaks have shipped before)
+    # and silently break the pin. highspy is pinned to an exact version;
+    # pyomo to the minor (its wrapper layer is more stable). If you bump
+    # either bound, re-run the regression pin first; if it drifts within
+    # ULP-noise, update the goldens (NOT the bounds) after a manual sanity
+    # check.
+    "pyomo~=6.10.0",
+    "highspy==1.14.0",
     "apscheduler",
 ]
 
@@ -19,6 +29,8 @@ notebooks = ["jupyter", "ipykernel"]
 
 [project.scripts]
 optimization-backtest = "optimization.backtest:main"
+optimization-init-state = "optimization.init_state:main"
+optimization-write-default-config = "optimization.write_default_config:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

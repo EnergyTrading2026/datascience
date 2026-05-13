@@ -120,17 +120,25 @@ def main() -> int:
             overall_ok = False
         else:
             df = pd.read_parquet(tmp_path / "dispatch.parquet")
-            _check("4 dispatch rows (1h commit @ QH)", len(df) == 4)
-            _check(
-                "15-min gap in dispatch",
-                (df.index[1] - df.index[0]) == pd.Timedelta(minutes=15),
-            )
+            # Long format since feat/modular-assets: one row per
+            # (timestamp, asset_id, family, quantity). Pull SoC for the legacy
+            # default's lone storage and verify the commit window shape.
+            soc = df[(df["family"] == "storage") & (df["quantity"] == "soc_end_mwh_th")]
+            unique_ts = soc.index.unique().sort_values()
+            _check("4 dispatch timestamps (1h commit @ QH)", len(unique_ts) == 4)
+            if len(unique_ts) >= 2:
+                _check(
+                    "15-min gap in dispatch",
+                    (unique_ts[1] - unique_ts[0]) == pd.Timedelta(minutes=15),
+                )
             _check(
                 "SoC within bounds [50, 200]",
-                df["soc_end_mwh_th"].between(50.0, 200.0).all(),
+                soc["value"].between(50.0, 200.0).all(),
             )
-            print(f"        commit window: {df.index[0]}  →  {df.index[-1]}")
-            print(f"        SoC trajectory: {[round(v, 1) for v in df['soc_end_mwh_th'].tolist()]}")
+            if len(unique_ts):
+                print(f"        commit window: {unique_ts[0]}  →  {unique_ts[-1]}")
+            soc_traj = soc.sort_index()["value"].tolist()
+            print(f"        SoC trajectory: {[round(v, 1) for v in soc_traj]}")
 
     print("\n" + "-" * 64)
     print("OVERALL: " + ("OK" if overall_ok else "FAIL"))

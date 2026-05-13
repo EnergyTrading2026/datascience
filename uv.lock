@@ -469,14 +469,14 @@ notebooks = [
 [package.metadata]
 requires-dist = [
     { name = "apscheduler" },
-    { name = "highspy" },
+    { name = "highspy", specifier = "==1.14.0" },
     { name = "ipykernel", marker = "extra == 'notebooks'" },
     { name = "jupyter", marker = "extra == 'notebooks'" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
-    { name = "pyomo" },
+    { name = "pyomo", specifier = "~=6.10.0" },
     { name = "pytest", marker = "extra == 'dev'" },
 ]
 provides-extras = ["dev", "notebooks"]

@@ -36,13 +36,13 @@ from typing import Optional
 import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from optimization.config import RuntimeConfig
+from optimization.config import PlantConfig, RuntimeConfig
 from optimization.run import run_one_cycle
 from optimization.state import DispatchState
 
 logger = logging.getLogger("optimization.daemon")
 
-FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\.parquet$")
+FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\.parquet$")
 HEARTBEAT_NAME = ".heartbeat"
 CURRENT_NAME = "current.json"
 STALE_GRACE_HOURS = 2  # ignore forecasts whose solve_time is older than this
@@ -61,10 +61,15 @@ class DaemonConfig:
     resolution: str
     forecast_resolution: str
     scan_interval_s: int
+    # Path to plant_config.json, or None to use PlantConfig.legacy_default().
+    # The actual PlantConfig is loaded once at daemon start (run()) and passed
+    # to every cycle; editing this file mid-run has no effect until restart.
+    config_file: Optional[Path] = None
 
     @classmethod
     def from_env(cls) -> "DaemonConfig":
         prices_path_str = os.environ.get("PRICES_PATH")
+        config_file_str = os.environ.get("CONFIG_FILE")
         return cls(
             forecast_dir=Path(os.environ.get("FORECAST_DIR", "/shared/forecast")),
             state_dir=Path(os.environ.get("STATE_DIR", "/shared/state")),
@@ -74,6 +79,7 @@ class DaemonConfig:
             resolution=os.environ.get("RESOLUTION", "quarterhour"),
             forecast_resolution=os.environ.get("FORECAST_RESOLUTION", "hour"),
             scan_interval_s=int(os.environ.get("SCAN_INTERVAL_S", "2")),
+            config_file=Path(config_file_str) if config_file_str else None,
         )
 
 
@@ -92,10 +98,22 @@ def _parse_solve_time(filename: str) -> Optional[pd.Timestamp]:
     m = FORECAST_FILENAME_RE.match(filename)
     if not m:
         return None
-    return pd.Timestamp(m.group(1))
+    # Filenames use hyphens in the time portion (e.g. 2026-05-13T14-00-00Z)
+    # because Windows rejects ':' in paths. Restore the ISO form for pandas.
+    date_part, time_part = m.group(1).split("T", 1)
+    iso = f"{date_part}T{time_part[:2]}:{time_part[3:5]}:{time_part[6:8]}Z"
+    return pd.Timestamp(iso)
 
 
-def _scan_newest_forecast(forecast_dir: Path) -> Optional[pd.Timestamp]:
+def _scan_newest_forecast(
+    forecast_dir: Path,
+    max_solve_time: Optional[pd.Timestamp] = None,
+) -> Optional[pd.Timestamp]:
+    """Newest parseable forecast filename, optionally capped at ``max_solve_time``.
+
+    The cap exists so a single implausibly-future filename (e.g. clock-skewed
+    upstream writer) cannot mask all legitimate forecasts in the same directory.
+    """
     if not forecast_dir.is_dir():
         return None
     candidates: list[pd.Timestamp] = []
@@ -103,8 +121,11 @@ def _scan_newest_forecast(forecast_dir: Path) -> Optional[pd.Timestamp]:
         if not entry.is_file():
             continue
         ts = _parse_solve_time(entry.name)
-        if ts is not None:
-            candidates.append(ts)
+        if ts is None:
+            continue
+        if max_solve_time is not None and ts > max_solve_time:
+            continue
+        candidates.append(ts)
     return max(candidates) if candidates else None
 
 
@@ -151,10 +172,20 @@ def _read_last_solve_time(
         return None
 
 
-def _run_one(cfg: DaemonConfig, solve_time: pd.Timestamp) -> int:
-    """Execute one cycle for the given solve_time. Returns the exit code from run.py."""
-    fname = f"{solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet"
-    state_fname = f"{solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.json"
+def _run_one(
+    cfg: DaemonConfig,
+    solve_time: pd.Timestamp,
+    plant_config: Optional[PlantConfig] = None,
+) -> int:
+    """Execute one cycle for the given solve_time. Returns the exit code from run.py.
+
+    ``plant_config`` is the pre-loaded PlantConfig (from ``cfg.config_file`` or
+    None for legacy_default). Threaded through to ``run_one_cycle`` so the
+    daemon honors the operator's plant configuration instead of silently using
+    the legacy default.
+    """
+    fname = f"{solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet"
+    state_fname = f"{solve_time.strftime('%Y-%m-%dT%H-%M-%SZ')}.json"
     forecast_path = cfg.forecast_dir / fname
     dispatch_path = cfg.dispatch_dir / fname
     dispatch_tmp = dispatch_path.with_suffix(dispatch_path.suffix + ".tmp")
@@ -180,6 +211,7 @@ def _run_one(cfg: DaemonConfig, solve_time: pd.Timestamp) -> int:
             state_out=state_dated,
             dispatch_out=dispatch_tmp,
             cold_start=False,
+            config=plant_config,
             prices_source=cfg.prices_source,
             resolution=cfg.resolution,
             forecast_resolution=cfg.forecast_resolution,
@@ -238,7 +270,12 @@ def _should_run(
     return True
 
 
-def _worker(cfg: DaemonConfig, work_queue: "queue.Queue[object]", stop_event: threading.Event) -> None:
+def _worker(
+    cfg: DaemonConfig,
+    work_queue: "queue.Queue[object]",
+    stop_event: threading.Event,
+    plant_config: Optional[PlantConfig] = None,
+) -> None:
     while not stop_event.is_set():
         item = work_queue.get()
         try:
@@ -249,7 +286,7 @@ def _worker(cfg: DaemonConfig, work_queue: "queue.Queue[object]", stop_event: th
             if not _should_run(cfg, solve_time, last_solve_time):
                 continue
             try:
-                _run_one(cfg, solve_time)
+                _run_one(cfg, solve_time, plant_config=plant_config)
             except Exception:
                 logger.exception("cycle crashed for solve_time=%s", solve_time.isoformat())
         finally:
@@ -266,7 +303,13 @@ def _scan(
     Idempotent on quiet ticks: returns silently if nothing has changed since
     the last enqueue. Logs only when a new file is actually picked up.
     """
-    newest = _scan_newest_forecast(cfg.forecast_dir)
+    # Cap the candidate set to plausibly-current filenames. A single
+    # bogus far-future file otherwise wins ``max()`` against every legitimate
+    # forecast in the same directory — and advancing the watermark to that
+    # timestamp would then filter out everything real that follows.
+    now = pd.Timestamp.now(tz="UTC")
+    max_ts = now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS)
+    newest = _scan_newest_forecast(cfg.forecast_dir, max_solve_time=max_ts)
     if newest is None:
         return
     last_solve_time = _read_last_solve_time(cfg.state_dir)
@@ -302,11 +345,25 @@ def run(argv: list[str] | None = None) -> int:
                 cfg.state_dir / CURRENT_NAME,
             )
 
+    plant_config: Optional[PlantConfig] = None
+    if cfg.config_file is not None:
+        try:
+            plant_config = PlantConfig.from_json(cfg.config_file)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error("plant config load failed (%s): %s", cfg.config_file, e)
+            return 1
+        logger.info(
+            "loaded plant config from %s (%d HPs, %d boilers, %d CHPs, %d storages)",
+            cfg.config_file, len(plant_config.heat_pumps), len(plant_config.boilers),
+            len(plant_config.chps), len(plant_config.storages),
+        )
+
     logger.info(
-        "daemon starting: forecast=%s state=%s dispatch=%s prices=%s resolution=%s/%s scan=%ds",
+        "daemon starting: forecast=%s state=%s dispatch=%s prices=%s resolution=%s/%s scan=%ds config=%s",
         cfg.forecast_dir, cfg.state_dir, cfg.dispatch_dir,
         cfg.prices_source, cfg.resolution, cfg.forecast_resolution,
         cfg.scan_interval_s,
+        cfg.config_file if cfg.config_file is not None else "<legacy_default>",
     )
 
     work_queue: "queue.Queue[object]" = queue.Queue()
@@ -314,7 +371,10 @@ def run(argv: list[str] | None = None) -> int:
     scan_state = _ScanState()
 
     worker_thread = threading.Thread(
-        target=_worker, args=(cfg, work_queue, stop_event), name="mpc-worker", daemon=True,
+        target=_worker,
+        args=(cfg, work_queue, stop_event, plant_config),
+        name="mpc-worker",
+        daemon=True,
     )
     worker_thread.start()
 
