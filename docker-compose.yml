@@ -22,6 +22,16 @@
 #     data/forecast/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (input)
 #     data/state/      current.json + dated history    (persistent)
 #     data/dispatch/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (output)
+#     data/config/     plant_config.json (optional)    (input, read-only)
+#
+# Plant config (multi-asset):
+#     With CONFIG_FILE unset, both services run on PlantConfig.legacy_default()
+#     (1 HP + 1 boiler + 1 CHP + 1 storage). To deploy a custom plant:
+#         1. drop plant_config.json into ./data/config/
+#         2. set CONFIG_FILE=/shared/config/plant_config.json (e.g. in .env)
+#         3. docker compose up -d --build
+#     The path must match between init-state (seeds matching state) and the
+#     daemon (every cycle); using the same env var here guarantees that.
 
 x-optimization-image: &optimization-image
   build:
@@ -34,9 +44,20 @@ services:
     <<: *optimization-image
     container_name: optimization-init-state
     restart: "no"
-    command: ["-m", "optimization.init_state", "--state-out", "/shared/state/current.json"]
+    # Shell-form command so we can conditionally pass --config-file only when
+    # CONFIG_FILE is set. Without the conditional, an empty CONFIG_FILE would
+    # be passed as --config-file "" and init-state would error out.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        python -m optimization.init_state \
+          --state-out /shared/state/current.json \
+          $${CONFIG_FILE:+--config-file "$$CONFIG_FILE"}
+    environment:
+      CONFIG_FILE: ${CONFIG_FILE:-}
     volumes:
       - ./data/state:/shared/state
+      - ./data/config:/shared/config:ro
     logging:
       driver: json-file
       options:
@@ -55,6 +76,10 @@ services:
       FORECAST_DIR: /shared/forecast
       STATE_DIR: /shared/state
       DISPATCH_DIR: /shared/dispatch
+      # Empty = PlantConfig.legacy_default(); set to a path inside the
+      # container (e.g. /shared/config/plant_config.json) to deploy multi-asset.
+      # Daemon reads this once at startup; restart the container after editing.
+      CONFIG_FILE: ${CONFIG_FILE:-}
       PRICES_SOURCE: ${PRICES_SOURCE:-live}
       RESOLUTION: ${RESOLUTION:-quarterhour}
       FORECAST_RESOLUTION: ${FORECAST_RESOLUTION:-hour}
@@ -63,6 +88,7 @@ services:
       - ./data/forecast:/shared/forecast:ro
       - ./data/state:/shared/state
       - ./data/dispatch:/shared/dispatch
+      - ./data/config:/shared/config:ro
     healthcheck:
       # Heartbeat is seeded during init-state and then bumped by the daemon
       # after every successful cycle. 5400s = 90 min: well past the hourly

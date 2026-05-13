@@ -1,26 +1,55 @@
-"""Format MPC MILP dispatch output as a backend-ready JSON payload."""
+"""Format MPC MILP dispatch output as a backend-ready JSON payload.
+
+Schema v2.0 contract
+====================
+
+The backend export wraps each family in an array keyed by stable asset id, so
+plants with N>1 heat pumps / boilers / CHPs / storages serialize without losing
+per-unit granularity:
+
+    "dispatch": [
+        {
+            "timestamp": "...",
+            "step": 0,
+            "demand_mw_th": ...,
+            "price_eur_per_mwh_el": ...,
+            "heat_pumps": [{"id": "hp_1", "on": ..., "el_in_mw": ..., "th_out_mw": ...}, ...],
+            "boilers":    [{"id": "...",  "on": ..., "th_out_mw": ...}, ...],
+            "chps":       [{"id": "...",  "on": ..., "el_out_mw": ..., "th_out_mw": ...}, ...],
+            "storages":   [{"id": "...",  "charge_mw_th": ..., "discharge_mw_th": ..., "soc_mwh_th": ...}, ...],
+            "heat_slack_mw_th": ...
+        }
+    ],
+    "next_initial_state": {
+        "units":    {"<asset_id>": {"on": bool, "time_in_state_steps": int}, ...},
+        "storages": {"<storage_id>": {"soc_mwh_th": float}, ...}
+    }
+
+Application-Repo consumers must iterate the family arrays / dicts; the v1.0
+singular shape (heat_pump/boiler/chp/storage as scalars) is gone.
+
+prepare_optimization_export now expects ``dispatch_records`` as an already-
+structured list of per-step dicts. Run.py's _dispatch_records() builds these
+directly from the solved Pyomo model — no wide-DataFrame intermediate, because
+the column space would have been dynamic in asset_id space.
+"""
 
 from __future__ import annotations
 
-import json, math
+import json
+import math
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from numbers import Number
 from typing import Any
 from uuid import uuid4
 
 import pandas as pd
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "2.0"
 DEFAULT_APPROACH_NAME = "mpc_milp"
 DEFAULT_TIMEZONE = "UTC"
-FLOAT_COLUMN_NAMES = (
-    "demand_th", "price_el", "hp_el_in", "hp_th_out", "boiler_th_out", "chp_el_out",
-    "chp_th_out", "storage_charge", "storage_discharge", "storage_soc", "heat_slack",
-)
-FLOAT_COLUMNS: dict[str, float] = {name: 0.0 for name in FLOAT_COLUMN_NAMES}
-BOOL_COLUMNS: dict[str, bool] = {"hp_on": False, "boiler_on": False, "chp_on": False}
-OPTIONAL_COLUMNS: tuple[str, ...] = FLOAT_COLUMN_NAMES + tuple(BOOL_COLUMNS)
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -33,6 +62,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         return float(default)
     return result if math.isfinite(result) else float(default)
+
 
 def _safe_bool(value: Any, default: bool = False) -> bool:
     try:
@@ -56,6 +86,16 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
     except (TypeError, ValueError):
         return bool(default)
 
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    return int(_safe_float(value, float(default)))
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    converted = _to_jsonable(value)
+    return default if converted is None else str(converted)
+
+
 def _serialize_timestamp(value: Any) -> str:
     if value is None:
         return ""
@@ -72,61 +112,18 @@ def _serialize_timestamp(value: Any) -> str:
         return str(value)
     return "" if pd.isna(parsed) else parsed.isoformat()
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    return int(_safe_float(value, float(default)))
-
-def _safe_str(value: Any, default: str = "") -> str:
-    converted = _to_jsonable(value)
-    return default if converted is None else str(converted)
 
 def _get(mapping: Mapping[str, Any], key: str, default: Any = None) -> Any:
     return mapping.get(key, default) if isinstance(mapping, Mapping) else default
 
+
 def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
 
 def _pick(*values: Any, default: Any = None) -> Any:
     return next((value for value in values if value is not None), default)
 
-def _row_value(row: pd.Series, column: str) -> Any:
-    return row[column] if column in row.index else FLOAT_COLUMNS.get(column, BOOL_COLUMNS.get(column))
-
-def _infer_dt_hours(dispatch_df: pd.DataFrame, metadata: Mapping[str, Any]) -> float:
-    approach = _as_mapping(_get(metadata, "approach"))
-    dt_hours = _safe_float(_pick(_get(metadata, "dt_hours"), _get(approach, "dt_hours")), 0.0)
-    if dt_hours > 0:
-        return dt_hours
-    if isinstance(dispatch_df.index, pd.DatetimeIndex) and len(dispatch_df.index) > 1:
-        hours = (dispatch_df.index[1] - dispatch_df.index[0]).total_seconds() / 3600
-        if math.isfinite(hours) and hours > 0:
-            return float(hours)
-    return 1.0
-
-def _timestamp_for_row(row: pd.Series, index_value: Any, step: int, metadata: Mapping[str, Any], dt_hours: float) -> str:
-    for column in ("timestamp", "time", "datetime"):
-        if column in row.index and (timestamp := _serialize_timestamp(row[column])):
-            return timestamp
-    if not isinstance(index_value, Number) and (timestamp := _serialize_timestamp(index_value)):
-        return timestamp
-    time_window = _as_mapping(_get(metadata, "time_window"))
-    start = _pick(_get(metadata, "start"), _get(time_window, "start"))
-    try:
-        parsed_start = pd.Timestamp(start)
-    except (TypeError, ValueError, OverflowError):
-        return ""
-    return "" if pd.isna(parsed_start) else (parsed_start + pd.Timedelta(hours=step * dt_hours)).isoformat()
-
-def _build_dispatch_row(row: pd.Series, step: int, timestamp: str) -> dict[str, Any]:
-    return {
-        "timestamp": timestamp, "step": step,
-        "demand_mw_th": _safe_float(_row_value(row, "demand_th")),
-        "price_eur_per_mwh_el": _safe_float(_row_value(row, "price_el")),
-        "heat_pump": {"on": _safe_bool(_row_value(row, "hp_on")), "el_in_mw": _safe_float(_row_value(row, "hp_el_in")), "th_out_mw": _safe_float(_row_value(row, "hp_th_out"))},
-        "boiler": {"on": _safe_bool(_row_value(row, "boiler_on")), "th_out_mw": _safe_float(_row_value(row, "boiler_th_out"))},
-        "chp": {"on": _safe_bool(_row_value(row, "chp_on")), "el_out_mw": _safe_float(_row_value(row, "chp_el_out")), "th_out_mw": _safe_float(_row_value(row, "chp_th_out"))},
-        "storage": {"charge_mw_th": _safe_float(_row_value(row, "storage_charge")), "discharge_mw_th": _safe_float(_row_value(row, "storage_discharge")), "soc_mwh_th": _safe_float(_row_value(row, "storage_soc"))},
-        "heat_slack_mw_th": _safe_float(_row_value(row, "heat_slack")),
-    }
 
 def _to_jsonable(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -150,57 +147,193 @@ def _to_jsonable(value: Any) -> Any:
         pass
     return value if not isinstance(value, float) or math.isfinite(value) else None
 
+
 def export_to_json(payload: Mapping[str, Any], *, indent: int | None = 2) -> str:
     return json.dumps(_to_jsonable(payload), indent=indent, default=lambda value: str(_to_jsonable(value)))
 
-def prepare_optimization_export(dispatch_df: pd.DataFrame, metadata: dict[str, Any], solver_info: dict[str, Any], initial_state: dict[str, Any], next_state: dict[str, Any]) -> dict[str, Any]:
-    """Prepare a backend API export payload from optimization dispatch output."""
+
+# v2.0 per-row family-array shapes. Used to coerce caller-supplied records
+# defensively (caller may pass numpy scalars, native Python, NaN, ...).
+_HP_FIELDS: tuple[str, ...] = ("on", "el_in_mw", "th_out_mw")
+_BOILER_FIELDS: tuple[str, ...] = ("on", "th_out_mw")
+_CHP_FIELDS: tuple[str, ...] = ("on", "el_out_mw", "th_out_mw")
+_STORAGE_FIELDS: tuple[str, ...] = ("charge_mw_th", "discharge_mw_th", "soc_mwh_th")
+
+
+def _coerce_unit_entry(entry: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Coerce one element of a family array. Always emits id (str) plus each
+    field — booleans for ``on``, floats for the rest."""
+    src = _as_mapping(entry)
+    out: dict[str, Any] = {"id": _safe_str(_get(src, "id"))}
+    for field in fields:
+        raw = _get(src, field)
+        if field == "on":
+            out[field] = _safe_bool(raw)
+        else:
+            out[field] = _safe_float(raw)
+    return out
+
+
+def _coerce_storage_entry(entry: Any) -> dict[str, Any]:
+    src = _as_mapping(entry)
+    out: dict[str, Any] = {"id": _safe_str(_get(src, "id"))}
+    for field in _STORAGE_FIELDS:
+        out[field] = _safe_float(_get(src, field))
+    return out
+
+
+def _build_dispatch_row(record: Mapping[str, Any], step: int, fallback_ts: str) -> dict[str, Any]:
+    """Coerce one caller-supplied dispatch record into the v2.0 row shape."""
+    timestamp = _serialize_timestamp(_get(record, "timestamp")) or fallback_ts
+    return {
+        "timestamp": timestamp,
+        "step": _safe_int(_get(record, "step"), step),
+        "demand_mw_th": _safe_float(_get(record, "demand_mw_th")),
+        "price_eur_per_mwh_el": _safe_float(_get(record, "price_eur_per_mwh_el")),
+        "heat_pumps": [
+            _coerce_unit_entry(item, _HP_FIELDS)
+            for item in _get(record, "heat_pumps", []) or []
+        ],
+        "boilers": [
+            _coerce_unit_entry(item, _BOILER_FIELDS)
+            for item in _get(record, "boilers", []) or []
+        ],
+        "chps": [
+            _coerce_unit_entry(item, _CHP_FIELDS)
+            for item in _get(record, "chps", []) or []
+        ],
+        "storages": [
+            _coerce_storage_entry(item)
+            for item in _get(record, "storages", []) or []
+        ],
+        "heat_slack_mw_th": _safe_float(_get(record, "heat_slack_mw_th")),
+    }
+
+
+def _coerce_state(state: Any) -> dict[str, Any]:
+    """v2.0 next_initial_state shape: units{} for unit-commitment assets,
+    storages{} for thermal storages. Mirrors DispatchState on the DS side."""
+    src = _as_mapping(state)
+    units_in = _as_mapping(_get(src, "units"))
+    storages_in = _as_mapping(_get(src, "storages"))
+    units_out: dict[str, Any] = {}
+    for asset_id, payload in units_in.items():
+        p = _as_mapping(payload)
+        units_out[_safe_str(asset_id)] = {
+            "on": _safe_bool(_get(p, "on")),
+            "time_in_state_steps": _safe_int(_get(p, "time_in_state_steps")),
+        }
+    storages_out: dict[str, Any] = {}
+    for storage_id, payload in storages_in.items():
+        p = _as_mapping(payload)
+        storages_out[_safe_str(storage_id)] = {
+            "soc_mwh_th": _safe_float(_get(p, "soc_mwh_th")),
+        }
+    return {"units": units_out, "storages": storages_out}
+
+
+def prepare_optimization_export(
+    dispatch_records: list[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+    solver_info: Mapping[str, Any],
+    initial_state: Mapping[str, Any],
+    next_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prepare a backend API export payload (schema v2.0).
+
+    Args:
+        dispatch_records: per-step dicts already structured with family arrays.
+            Build via run.py's ``_dispatch_records`` from a solved Pyomo model.
+        metadata: run_id, status, approach{name, solve_horizon_hours,
+            commit_horizon_hours, dt_hours}, time_window{start, end, timezone},
+            objective_cost_eur, real_cost_eur, ...
+        solver_info: solver, runtime_seconds, termination_condition, status.
+        initial_state, next_state: DispatchState-shaped dicts with
+            ``units{<id>: {on, time_in_state_steps}}`` and
+            ``storages{<id>: {soc_mwh_th}}``.
+    """
     warnings: list[str] = []
     metadata_map = _as_mapping(metadata)
     solver_map = _as_mapping(solver_info)
-    next_state_map = _as_mapping(next_state)
 
-    for name, value in {"metadata": metadata, "solver_info": solver_info, "initial_state": initial_state, "next_state": next_state}.items():
+    for name, value in {
+        "metadata": metadata,
+        "solver_info": solver_info,
+        "initial_state": initial_state,
+        "next_state": next_state,
+    }.items():
         if not isinstance(value, Mapping):
             warnings.append(f"{name} was not a mapping; defaults were used.")
-    if isinstance(dispatch_df, pd.DataFrame):
-        dispatch_df = dispatch_df.copy()
-    else:
-        warnings.append("dispatch_df was not a pandas DataFrame; dispatch is empty.")
-        dispatch_df = pd.DataFrame()
-    for column in OPTIONAL_COLUMNS:
-        if column not in dispatch_df.columns:
-            default = FLOAT_COLUMNS.get(column, BOOL_COLUMNS.get(column))
-            warnings.append(f"Missing optional dispatch column '{column}'; defaulted to {default!r}.")
 
-    dt_hours = _infer_dt_hours(dispatch_df, metadata_map)
-    dispatch: list[dict[str, Any]] = []
-    timestamp_warning_added = False
-    for step, (index_value, row) in enumerate(dispatch_df.iterrows()):
-        timestamp = _timestamp_for_row(row, index_value, step, metadata_map, dt_hours)
-        if not timestamp and not timestamp_warning_added:
-            warnings.append("No timestamp source found; timestamps defaulted to ''.")
-            timestamp_warning_added = True
-        dispatch.append(_build_dispatch_row(row, step, timestamp))
-    if dispatch_df.empty:
-        warnings.append("dispatch_df is empty; exported an empty dispatch list.")
+    if not isinstance(dispatch_records, list):
+        warnings.append("dispatch_records was not a list; dispatch is empty.")
+        dispatch_records = []
 
     approach = _as_mapping(_get(metadata_map, "approach"))
     summary = _as_mapping(_get(metadata_map, "summary"))
     time_window = _as_mapping(_get(metadata_map, "time_window"))
-    horizon_default = round(len(dispatch_df) * dt_hours)
+
+    dt_hours = _safe_float(
+        _pick(_get(metadata_map, "dt_hours"), _get(approach, "dt_hours")),
+        0.0,
+    )
+    if dt_hours <= 0:
+        # Try inferring from the first two record timestamps.
+        if len(dispatch_records) >= 2:
+            try:
+                t0 = pd.Timestamp(_get(dispatch_records[0], "timestamp"))
+                t1 = pd.Timestamp(_get(dispatch_records[1], "timestamp"))
+                hours = (t1 - t0).total_seconds() / 3600
+                if math.isfinite(hours) and hours > 0:
+                    dt_hours = float(hours)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if dt_hours <= 0:
+            dt_hours = 1.0
+
+    fallback_start = _serialize_timestamp(
+        _pick(_get(time_window, "start"), _get(metadata_map, "start"))
+    )
+
+    dispatch: list[dict[str, Any]] = []
+    timestamp_warning_added = False
+    for step, record in enumerate(dispatch_records):
+        if fallback_start:
+            try:
+                fallback_ts = (
+                    pd.Timestamp(fallback_start) + pd.Timedelta(hours=step * dt_hours)
+                ).isoformat()
+            except (TypeError, ValueError, OverflowError):
+                fallback_ts = ""
+        else:
+            fallback_ts = ""
+        row = _build_dispatch_row(record, step, fallback_ts)
+        if not row["timestamp"] and not timestamp_warning_added:
+            warnings.append("No timestamp source found; timestamps defaulted to ''.")
+            timestamp_warning_added = True
+        dispatch.append(row)
+    if not dispatch_records:
+        warnings.append("dispatch_records is empty; exported an empty dispatch list.")
+
+    horizon_default = round(len(dispatch_records) * dt_hours)
     run_id = _get(metadata_map, "run_id")
     if run_id is None:
         run_id = str(uuid4())
         warnings.append("metadata.run_id was missing; generated a UUID run_id.")
 
-    start = _serialize_timestamp(_pick(_get(time_window, "start"), _get(metadata_map, "start")))
-    end = _serialize_timestamp(_pick(_get(time_window, "end"), _get(metadata_map, "end")))
+    start = _serialize_timestamp(
+        _pick(_get(time_window, "start"), _get(metadata_map, "start"))
+    )
+    end = _serialize_timestamp(
+        _pick(_get(time_window, "end"), _get(metadata_map, "end"))
+    )
     if not start and dispatch:
         start = dispatch[0]["timestamp"]
     if not end and dispatch:
         try:
-            end = (pd.Timestamp(dispatch[-1]["timestamp"]) + pd.Timedelta(hours=dt_hours)).isoformat()
+            end = (
+                pd.Timestamp(dispatch[-1]["timestamp"]) + pd.Timedelta(hours=dt_hours)
+            ).isoformat()
         except (TypeError, ValueError, OverflowError):
             end = dispatch[-1]["timestamp"]
     if not start:
@@ -208,43 +341,149 @@ def prepare_optimization_export(dispatch_df: pd.DataFrame, metadata: dict[str, A
     if not end:
         warnings.append("time_window.end could not be inferred; defaulted to ''.")
 
-    objective_cost = _pick(_get(summary, "objective_cost_eur"), _get(metadata_map, "objective_cost_eur"), _get(solver_map, "objective_cost_eur"), default=0.0)
-    real_cost = _pick(_get(summary, "real_cost_eur"), _get(metadata_map, "real_cost_eur"), _get(solver_map, "real_cost_eur"), default=objective_cost)
-    runtime = _pick(_get(summary, "runtime_seconds"), _get(metadata_map, "runtime_seconds"), _get(solver_map, "runtime_seconds"), default=0.0)
-    status = _pick(_get(solver_map, "status"), _get(metadata_map, "status"), default="unknown")
-    solver = _pick(_get(summary, "solver"), _get(metadata_map, "solver"), _get(solver_map, "solver"), default="unknown")
-    termination = _pick(_get(summary, "termination_condition"), _get(metadata_map, "termination_condition"), _get(solver_map, "termination_condition"), default="unknown")
+    objective_cost = _pick(
+        _get(summary, "objective_cost_eur"),
+        _get(metadata_map, "objective_cost_eur"),
+        _get(solver_map, "objective_cost_eur"),
+        default=0.0,
+    )
+    real_cost = _pick(
+        _get(summary, "real_cost_eur"),
+        _get(metadata_map, "real_cost_eur"),
+        _get(solver_map, "real_cost_eur"),
+        default=objective_cost,
+    )
+    runtime = _pick(
+        _get(summary, "runtime_seconds"),
+        _get(metadata_map, "runtime_seconds"),
+        _get(solver_map, "runtime_seconds"),
+        default=0.0,
+    )
+    status = _pick(
+        _get(solver_map, "status"), _get(metadata_map, "status"), default="unknown"
+    )
+    solver = _pick(
+        _get(summary, "solver"),
+        _get(metadata_map, "solver"),
+        _get(solver_map, "solver"),
+        default="unknown",
+    )
+    termination = _pick(
+        _get(summary, "termination_condition"),
+        _get(metadata_map, "termination_condition"),
+        _get(solver_map, "termination_condition"),
+        default="unknown",
+    )
 
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_id": _safe_str(run_id),
         "status": _safe_str(status, "unknown"),
         "approach": {
-            "name": _safe_str(_pick(_get(approach, "name"), _get(metadata_map, "approach_name")), DEFAULT_APPROACH_NAME),
-            "solve_horizon_hours": _safe_int(_pick(_get(approach, "solve_horizon_hours"), _get(metadata_map, "solve_horizon_hours")), horizon_default),
-            "commit_horizon_hours": _safe_int(_pick(_get(approach, "commit_horizon_hours"), _get(metadata_map, "commit_horizon_hours")), horizon_default),
+            "name": _safe_str(
+                _pick(_get(approach, "name"), _get(metadata_map, "approach_name")),
+                DEFAULT_APPROACH_NAME,
+            ),
+            "solve_horizon_hours": _safe_int(
+                _pick(
+                    _get(approach, "solve_horizon_hours"),
+                    _get(metadata_map, "solve_horizon_hours"),
+                ),
+                horizon_default,
+            ),
+            "commit_horizon_hours": _safe_int(
+                _pick(
+                    _get(approach, "commit_horizon_hours"),
+                    _get(metadata_map, "commit_horizon_hours"),
+                ),
+                horizon_default,
+            ),
             "dt_hours": dt_hours,
         },
-        "time_window": {"start": start, "end": end, "timezone": _safe_str(_pick(_get(time_window, "timezone"), _get(metadata_map, "timezone")), DEFAULT_TIMEZONE)},
-        "summary": {"objective_cost_eur": _safe_float(objective_cost), "real_cost_eur": _safe_float(real_cost), "runtime_seconds": _safe_float(runtime), "solver": _safe_str(solver, "unknown"), "termination_condition": _safe_str(termination, "unknown")},
+        "time_window": {
+            "start": start,
+            "end": end,
+            "timezone": _safe_str(
+                _pick(_get(time_window, "timezone"), _get(metadata_map, "timezone")),
+                DEFAULT_TIMEZONE,
+            ),
+        },
+        "summary": {
+            "objective_cost_eur": _safe_float(objective_cost),
+            "real_cost_eur": _safe_float(real_cost),
+            "runtime_seconds": _safe_float(runtime),
+            "solver": _safe_str(solver, "unknown"),
+            "termination_condition": _safe_str(termination, "unknown"),
+        },
         "dispatch": dispatch,
-        "next_initial_state": {"soc_mwh_th": _safe_float(_get(next_state_map, "soc_mwh_th", 0.0)), "heat_pump_on": _safe_bool(_get(next_state_map, "heat_pump_on", False)), "boiler_on": _safe_bool(_get(next_state_map, "boiler_on", False)), "chp_on": _safe_bool(_get(next_state_map, "chp_on", False)), "boiler_time_in_state_steps": _safe_int(_get(next_state_map, "boiler_time_in_state_steps", 0)), "chp_time_in_state_steps": _safe_int(_get(next_state_map, "chp_time_in_state_steps", 0))},
-        "diagnostics": {"notes": _safe_str(_pick(_get(metadata_map, "notes"), _get(solver_map, "notes"))), "warnings": list(dict.fromkeys(warnings))},
+        "initial_state": _coerce_state(initial_state),
+        "next_initial_state": _coerce_state(next_state),
+        "diagnostics": {
+            "notes": _safe_str(
+                _pick(_get(metadata_map, "notes"), _get(solver_map, "notes"))
+            ),
+            "warnings": list(dict.fromkeys(warnings)),
+        },
     }
-    # FastAPI: return this dict directly or bind it to a response model.
-    # Kafka: publish export_to_json(payload, indent=None) for stable encoding.
-    # Schema versioning: bump SCHEMA_VERSION only for backend contract changes.
-    # Protobuf migration: keep dict keys aligned with future message fields.
     return _to_jsonable(payload)
 
+
 if __name__ == "__main__":
+    # Smoke demo: 2 HPs, 1 boiler, 1 CHP, 1 storage, 2 hourly steps.
     index = pd.date_range(datetime(2026, 1, 1, tzinfo=timezone.utc), periods=2, freq="h")
-    dispatch = pd.DataFrame({"demand_th": [8.0, 8.4], "price_el": [92.5, 88.0], "hp_el_in": [1.2, 1.1], "hp_th_out": [3.6, 3.3], "boiler_th_out": [0.0, 0.0], "chp_el_out": [1.0, 1.0], "chp_th_out": [4.0, 4.0], "storage_discharge": [0.4, 1.1], "storage_soc": [11.6, 10.5], "hp_on": [True, True], "boiler_on": [False, False], "chp_on": [True, True]}, index=index)
+    records = [
+        {
+            "timestamp": index[step],
+            "step": step,
+            "demand_mw_th": 8.0 + 0.4 * step,
+            "price_eur_per_mwh_el": 92.5 - 4.5 * step,
+            "heat_pumps": [
+                {"id": "hp_1", "on": True, "el_in_mw": 1.2, "th_out_mw": 3.6},
+                {"id": "hp_2", "on": False, "el_in_mw": 0.0, "th_out_mw": 0.0},
+            ],
+            "boilers": [{"id": "boiler", "on": False, "th_out_mw": 0.0}],
+            "chps": [{"id": "chp", "on": True, "el_out_mw": 1.0, "th_out_mw": 4.0}],
+            "storages": [
+                {
+                    "id": "storage",
+                    "charge_mw_th": 0.0,
+                    "discharge_mw_th": 0.4 + 0.7 * step,
+                    "soc_mwh_th": 11.6 - 1.1 * step,
+                }
+            ],
+            "heat_slack_mw_th": 0.0,
+        }
+        for step in range(2)
+    ]
     payload = prepare_optimization_export(
-        dispatch_df=dispatch,
-        metadata={"run_id": "run-20260101-0000", "status": "optimal", "approach": {"solve_horizon_hours": 24, "commit_horizon_hours": 2, "dt_hours": 1}, "time_window": {"start": index[0], "end": index[-1] + timedelta(hours=1), "timezone": "UTC"}, "objective_cost_eur": 1250.75, "real_cost_eur": 381.42},
+        dispatch_records=records,
+        metadata={
+            "run_id": "run-20260101-0000",
+            "status": "optimal",
+            "approach": {
+                "name": "mpc_milp",
+                "solve_horizon_hours": 24,
+                "commit_horizon_hours": 2,
+                "dt_hours": 1,
+            },
+            "time_window": {
+                "start": index[0],
+                "end": index[-1] + pd.Timedelta(hours=1),
+                "timezone": "UTC",
+            },
+            "objective_cost_eur": 1250.75,
+            "real_cost_eur": 381.42,
+        },
         solver_info={"solver": "highs", "runtime_seconds": 3.84, "termination_condition": "optimal"},
-        initial_state={},
-        next_state={"soc_mwh_th": 10.5, "heat_pump_on": True, "chp_on": True},
+        initial_state={"units": {}, "storages": {}},
+        next_state={
+            "units": {
+                "hp_1": {"on": True, "time_in_state_steps": 8},
+                "hp_2": {"on": False, "time_in_state_steps": 16},
+                "boiler": {"on": False, "time_in_state_steps": 32},
+                "chp": {"on": True, "time_in_state_steps": 4},
+            },
+            "storages": {"storage": {"soc_mwh_th": 10.5}},
+        },
     )
     print(export_to_json(payload))

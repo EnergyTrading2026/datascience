@@ -1,22 +1,33 @@
 """Shared fixtures for optimization tests."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pandas as pd
 import pytest
 
-from optimization.config import PlantParams, RuntimeConfig
+from optimization.config import PlantConfig, RuntimeConfig
 from optimization.state import DispatchState
 
 
-@pytest.fixture
-def params() -> PlantParams:
-    return PlantParams()
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: tests that exercise the solver at the documented scaling envelope",
+    )
 
 
 @pytest.fixture
-def params_no_floor() -> PlantParams:
+def config() -> PlantConfig:
+    return PlantConfig.legacy_default()
+
+
+@pytest.fixture
+def config_no_floor() -> PlantConfig:
     """Notebook self-test reference uses bounds (0, 200). For regression checks."""
-    return PlantParams(sto_floor_mwh_th=0.0)
+    base = PlantConfig.legacy_default()
+    storages = tuple(replace(s, floor_mwh_th=0.0) for s in base.storages)
+    return replace(base, storages=storages)
 
 
 @pytest.fixture
@@ -25,8 +36,8 @@ def runtime() -> RuntimeConfig:
 
 
 @pytest.fixture
-def cold_state() -> DispatchState:
-    return DispatchState.cold_start(pd.Timestamp("2026-01-01 00:00:00", tz="Europe/Berlin"))
+def cold_state(config) -> DispatchState:
+    return DispatchState.cold_start(config, pd.Timestamp("2026-01-01 00:00:00", tz="Europe/Berlin"))
 
 
 @pytest.fixture

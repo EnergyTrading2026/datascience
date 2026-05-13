@@ -19,11 +19,10 @@ Library usage:
 CLI usage (after `pip install -e .`):
     optimization-backtest --start 2024-04-01 --end 2024-04-08 --output-dir out/backtest/
 
-The strategy hook lets a baseline implementation plug in without touching the
-loop. A strategy is a callable matching `StrategyFn`; it must produce a
-`StrategyResult` (committed dispatch + carry-over state + cost metrics) per
-cycle. Strategies signal "no dispatch this cycle" by raising
-`StrategyInfeasibleError`.
+Multi-asset note: KPIs aggregate across all assets in a family (sum of SoC over
+storages, count of on-units per family, sum of dispatch energy per family).
+With ``PlantConfig.legacy_default()`` (1 of each), aggregates equal the single
+asset's value, so legacy reports are unchanged.
 """
 from __future__ import annotations
 
@@ -32,13 +31,13 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 import pandas as pd
 
-from optimization.config import PlantParams, RuntimeConfig
+from optimization.config import PlantConfig, RuntimeConfig
 from optimization.dispatch import Dispatch, extract_dispatch, extract_state
 from optimization.model import build_model
 from optimization.solve import SolverInfeasibleError, solve
@@ -78,7 +77,7 @@ class StrategyFn(Protocol):
         forecast: pd.Series,
         prices: pd.Series,
         state: DispatchState,
-        params: PlantParams,
+        config: PlantConfig,
         runtime: RuntimeConfig,
         solve_time: pd.Timestamp,
     ) -> StrategyResult: ...
@@ -88,14 +87,14 @@ def mpc_strategy(
     forecast: pd.Series,
     prices: pd.Series,
     state: DispatchState,
-    params: PlantParams,
+    config: PlantConfig,
     runtime: RuntimeConfig,
     solve_time: pd.Timestamp,
 ) -> StrategyResult:
     """Default strategy: build + solve the production MILP."""
     try:
         model = build_model(
-            forecast, prices, state, params,
+            forecast, prices, state, config,
             demand_safety_factor=runtime.demand_safety_factor,
         )
         result = solve(
@@ -124,8 +123,16 @@ class BacktestResult:
     records: pd.DataFrame
     dispatch_log: pd.DataFrame
     summary: dict
-    params: dict
+    config: dict
     runtime: dict
+
+
+def _total_soc(state: DispatchState) -> float:
+    return float(sum(s.soc_mwh_th for s in state.storages.values()))
+
+
+def _count_on(state: DispatchState, asset_ids: list[str]) -> int:
+    return int(sum(state.units[i].on for i in asset_ids if i in state.units))
 
 
 def run_backtest(
@@ -133,7 +140,7 @@ def run_backtest(
     prices: pd.Series,
     start: pd.Timestamp,
     end: pd.Timestamp,
-    params: PlantParams | None = None,
+    config: PlantConfig | None = None,
     runtime: RuntimeConfig | None = None,
     strategy_fn: StrategyFn | None = None,
     initial_state: DispatchState | None = None,
@@ -146,16 +153,20 @@ def run_backtest(
             perfect-foresight forecast.
         prices: hourly DA prices (EUR/MWh), tz-aware index.
         start, end: tz-aware Berlin timestamps. Must be hour-aligned.
-        params: plant constants. Defaults to PlantParams().
+        config: plant configuration. Defaults to PlantConfig.legacy_default().
         runtime: solver/operational tuning. Defaults to RuntimeConfig().
         strategy_fn: dispatch strategy. Defaults to MPC.
         initial_state: carry-over state at `start`. Defaults to cold start.
         log_every: progress log frequency (in completed cycles). 0 = silent.
     """
-    params = params or PlantParams()
+    config = config or PlantConfig.legacy_default()
     runtime = runtime or RuntimeConfig()
     strategy_fn = strategy_fn or mpc_strategy
-    state = initial_state or DispatchState.cold_start(start)
+    state = initial_state or DispatchState.cold_start(config, start)
+
+    hp_ids = [hp.id for hp in config.heat_pumps]
+    boiler_ids = [b.id for b in config.boilers]
+    chp_ids = [c.id for c in config.chps]
 
     records: list[dict] = []
     dispatch_frames: list[pd.DataFrame] = []
@@ -184,12 +195,14 @@ def run_backtest(
 
         try:
             res = strategy_fn(
-                forecast_slice, price_slice, state, params, runtime, solve_time,
+                forecast_slice, price_slice, state, config, runtime, solve_time,
             )
         except StrategyInfeasibleError as e:
             n_infeasible += 1
             logger.warning("infeasible at %s: %s -- cold-starting next cycle", solve_time, e)
-            state = DispatchState.cold_start(solve_time + pd.Timedelta(hours=runtime.commit_hours))
+            state = DispatchState.cold_start(
+                config, solve_time + pd.Timedelta(hours=runtime.commit_hours)
+            )
             solve_time += pd.Timedelta(hours=runtime.commit_hours)
             continue
 
@@ -198,11 +211,13 @@ def run_backtest(
             "horizon_h": horizon_h,
             "objective_eur": res.objective_eur,
             "expected_cost_eur": res.expected_cost_eur,
-            "soc_start_mwh": state.sto_soc_mwh_th,
-            "soc_end_mwh": res.new_state.sto_soc_mwh_th,
-            "boiler_on_end": res.new_state.boiler_on,
-            "chp_on_end": res.new_state.chp_on,
-            "hp_on_end": res.new_state.hp_on,
+            "soc_start_mwh": _total_soc(state),
+            "soc_end_mwh": _total_soc(res.new_state),
+            # *_on_count_end = count of units of this family on at cycle end
+            # (0..N). For legacy 1-of-each plants this is still 0/1.
+            "boilers_on_count_end": _count_on(res.new_state, boiler_ids),
+            "chps_on_count_end": _count_on(res.new_state, chp_ids),
+            "hps_on_count_end": _count_on(res.new_state, hp_ids),
             "solve_time_s": res.solve_time_s,
         })
         dispatch_frames.append(res.dispatch.to_dataframe())
@@ -228,9 +243,22 @@ def run_backtest(
         records=records_df,
         dispatch_log=dispatch_log,
         summary=summary,
-        params=asdict(params),
+        config=config.to_dict(),
         runtime=asdict(runtime),
     )
+
+
+def _sum_family_quantity(df: pd.DataFrame, family: str, quantity: str) -> float:
+    """Sum 'value' over rows matching (family, quantity). 0.0 if none match.
+
+    Long-format aggregator: replaces wide-column-prefix scanning. The dispatch
+    log is one row per (timestamp, asset, quantity); summing across all assets
+    in a family is a simple boolean mask.
+    """
+    if not len(df):
+        return 0.0
+    mask = (df["family"] == family) & (df["quantity"] == quantity)
+    return float(df.loc[mask, "value"].sum())
 
 
 def _build_summary(
@@ -261,20 +289,24 @@ def _build_summary(
             "max_mwh": float(records["soc_end_mwh"].max()),
             "final_mwh": float(records["soc_end_mwh"].iloc[-1]),
         }
+        # Sum of "units-on at cycle end" across cycles, per family. With 1h
+        # commits this approximates unit-hours; with N units of a family it's
+        # cycle-aggregated unit-hours (max = N * n_cycles).
         summary["unit_on_hours"] = {
-            "boiler": int(records["boiler_on_end"].sum()),
-            "chp": int(records["chp_on_end"].sum()),
-            "hp": int(records["hp_on_end"].sum()),
+            "boiler": int(records["boilers_on_count_end"].sum()),
+            "chp": int(records["chps_on_count_end"].sum()),
+            "hp": int(records["hps_on_count_end"].sum()),
         }
     if len(dispatch_log):
         # 15-min interval energy, MWh_th. Useful sanity for total throughput.
+        # Long format: aggregate per (family, quantity) over all assets.
         dt_h = 0.25
         summary["total_energy_mwh_th"] = {
-            "boiler": float(dispatch_log["boiler_q_th_mw"].sum() * dt_h),
-            "chp_thermal_implied": float(dispatch_log["chp_p_el_mw"].sum() * dt_h),
-            "hp_electrical": float(dispatch_log["hp_p_el_mw"].sum() * dt_h),
-            "sto_charge": float(dispatch_log["sto_charge_mw_th"].sum() * dt_h),
-            "sto_discharge": float(dispatch_log["sto_discharge_mw_th"].sum() * dt_h),
+            "boiler": _sum_family_quantity(dispatch_log, "boiler", "q_th_mw") * dt_h,
+            "chp_thermal_implied": _sum_family_quantity(dispatch_log, "chp", "p_el_mw") * dt_h,
+            "hp_electrical": _sum_family_quantity(dispatch_log, "hp", "p_el_mw") * dt_h,
+            "sto_charge": _sum_family_quantity(dispatch_log, "storage", "charge_mw_th") * dt_h,
+            "sto_discharge": _sum_family_quantity(dispatch_log, "storage", "discharge_mw_th") * dt_h,
         }
     return summary
 
@@ -338,7 +370,7 @@ def write_outputs(result: BacktestResult, output_dir: Path) -> None:
 
     payload = {
         "summary": result.summary,
-        "params": result.params,
+        "config": result.config,
         "runtime": result.runtime,
     }
     (output_dir / "summary.json").write_text(json.dumps(_json_safe(payload), indent=2))
@@ -369,6 +401,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=Path("data/optimization/raw/Gro_handelspreise_202403010000_202603020000_Stunde.csv"))
     p.add_argument("--output-dir", type=Path, default=Path("out/backtest"))
     p.add_argument("--log-every", type=int, default=500)
+    p.add_argument(
+        "--config-file",
+        type=Path,
+        default=None,
+        help="Path to plant_config.json. Defaults to PlantConfig.legacy_default() "
+             "if omitted.",
+    )
     return p.parse_args(argv)
 
 
@@ -383,6 +422,16 @@ def main(argv: list[str] | None = None) -> int:
     demand = load_demand(args.demand_path)
     prices = load_smard_prices(args.prices_path)
 
+    if args.config_file is not None:
+        try:
+            config = PlantConfig.from_json(args.config_file)
+        except (FileNotFoundError, ValueError) as e:
+            logger.error("config load failed (%s): %s", args.config_file, e)
+            return 1
+        logger.info("loaded plant config from %s", args.config_file)
+    else:
+        config = PlantConfig.legacy_default()
+
     n_hours = (args.end - args.start).total_seconds() / 3600
     logger.info("backtest range: %s -> %s (%.0fh)", args.start, args.end, n_hours)
     logger.info("demand: %s -> %s, %d hourly values",
@@ -393,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_backtest(
         demand=demand, prices=prices,
         start=args.start, end=args.end,
-        params=PlantParams(), runtime=RuntimeConfig(),
+        config=config, runtime=RuntimeConfig(),
         log_every=args.log_every,
     )
 

@@ -4,11 +4,19 @@ from __future__ import annotations
 import json
 import os
 import queue
+from dataclasses import replace
 
 import pandas as pd
 
 from optimization import daemon, init_state
+from optimization.config import HeatPumpParams, PlantConfig
 from optimization.state import DispatchState
+
+_LEGACY = PlantConfig.legacy_default()
+
+
+def _cs(ts):
+    return DispatchState.cold_start(_LEGACY, ts)
 
 
 def _make_cfg(tmp_path):
@@ -27,7 +35,7 @@ def _make_cfg(tmp_path):
 def test_read_last_solve_time_undoes_commit_window(tmp_path):
     state_dir = tmp_path / "state"
     current = state_dir / "current.json"
-    DispatchState.cold_start(pd.Timestamp("2026-05-07T14:00:00Z")).save(current)
+    _cs(pd.Timestamp("2026-05-07T14:00:00Z")).save(current)
 
     last_solve_time = daemon._read_last_solve_time(state_dir, commit_hours=1)
 
@@ -44,7 +52,7 @@ def test_scan_enqueues_next_hour_after_previous_success(tmp_path):
 
     last_solve_time = pd.Timestamp.now(tz="UTC").floor("h")
     next_solve_time = last_solve_time + pd.Timedelta(hours=1)
-    DispatchState.cold_start(next_solve_time).save(state_dir / "current.json")
+    _cs(next_solve_time).save(state_dir / "current.json")
     (forecast_dir / f"{next_solve_time.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet").write_text("")
 
     cfg = daemon.DaemonConfig(
@@ -128,7 +136,7 @@ def test_run_one_stages_dispatch_until_state_commit(tmp_path, monkeypatch):
 
     solve_time = pd.Timestamp("2026-05-07T13:00:00Z")
     current = state_dir / "current.json"
-    initial_state = DispatchState.cold_start(solve_time)
+    initial_state = _cs(solve_time)
     initial_state.save(current)
 
     seen: dict[str, object] = {}
@@ -139,7 +147,7 @@ def test_run_one_stages_dispatch_until_state_commit(tmp_path, monkeypatch):
         seen["dispatch_out"] = dispatch_out
         seen["state_out"] = state_out
         dispatch_out.write_text("staged dispatch")
-        DispatchState.cold_start(solve_time + pd.Timedelta(hours=1)).save(state_out)
+        _cs(solve_time + pd.Timedelta(hours=1)).save(state_out)
         return 0
 
     monkeypatch.setattr(daemon, "run_one_cycle", fake_run_one_cycle)
@@ -177,11 +185,11 @@ def test_run_one_publishes_dispatch_before_advancing_state(tmp_path, monkeypatch
 
     solve_time = pd.Timestamp("2026-05-07T13:00:00Z")
     current = state_dir / "current.json"
-    DispatchState.cold_start(solve_time).save(current)
+    _cs(solve_time).save(current)
 
     def fake_run_one_cycle(**kwargs):
         kwargs["dispatch_out"].write_text("staged dispatch")
-        DispatchState.cold_start(solve_time + pd.Timedelta(hours=1)).save(kwargs["state_out"])
+        _cs(solve_time + pd.Timedelta(hours=1)).save(kwargs["state_out"])
         return 0
 
     replace_calls: list[tuple[os.PathLike[str] | str, os.PathLike[str] | str]] = []
@@ -226,12 +234,12 @@ def test_run_one_cleans_up_staged_outputs_after_crash(tmp_path, monkeypatch):
 
     solve_time = pd.Timestamp("2026-05-07T13:00:00Z")
     current = state_dir / "current.json"
-    original_state = DispatchState.cold_start(solve_time)
+    original_state = _cs(solve_time)
     original_state.save(current)
 
     def fake_run_one_cycle(**kwargs):
         kwargs["dispatch_out"].write_text("staged dispatch")
-        DispatchState.cold_start(solve_time + pd.Timedelta(hours=1)).save(kwargs["state_out"])
+        _cs(solve_time + pd.Timedelta(hours=1)).save(kwargs["state_out"])
         raise RuntimeError("boom after persistence")
 
     monkeypatch.setattr(daemon, "run_one_cycle", fake_run_one_cycle)
@@ -276,7 +284,7 @@ def test_init_state_writes_symlink_and_heartbeat(tmp_path):
 def test_init_state_backfills_missing_heartbeat_for_existing_state(tmp_path):
     state_out = tmp_path / "state" / "current.json"
     ts = pd.Timestamp("2026-05-07T13:00:00Z")
-    DispatchState.cold_start(ts).save(state_out)
+    _cs(ts).save(state_out)
 
     rc = init_state.main(["--state-out", str(state_out)])
 
@@ -288,3 +296,97 @@ def test_init_state_backfills_missing_heartbeat_for_existing_state(tmp_path):
 def test_runtime_entrypoints_import():
     assert callable(daemon.run)
     assert callable(init_state.main)
+
+
+def test_daemon_config_from_env_reads_config_file(monkeypatch, tmp_path):
+    """CONFIG_FILE env must surface as DaemonConfig.config_file (Path)."""
+    cfg_path = tmp_path / "plant_config.json"
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_path))
+    cfg = daemon.DaemonConfig.from_env()
+    assert cfg.config_file == cfg_path
+
+    monkeypatch.delenv("CONFIG_FILE", raising=False)
+    cfg2 = daemon.DaemonConfig.from_env()
+    assert cfg2.config_file is None
+
+
+def test_run_one_passes_plant_config_through_to_run_one_cycle(tmp_path, monkeypatch):
+    """The daemon must thread its loaded PlantConfig into run_one_cycle.
+
+    Regression for the bug where the daemon silently used legacy_default()
+    even when an operator had pointed CONFIG_FILE at a custom plant config.
+    """
+    forecast_dir = tmp_path / "forecast"
+    state_dir = tmp_path / "state"
+    dispatch_dir = tmp_path / "dispatch"
+    forecast_dir.mkdir()
+    state_dir.mkdir()
+    dispatch_dir.mkdir()
+
+    custom_cfg = replace(
+        PlantConfig.legacy_default(),
+        heat_pumps=(
+            HeatPumpParams(id="hp_a", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.5),
+            HeatPumpParams(id="hp_b", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.5),
+        ),
+    )
+
+    solve_time = pd.Timestamp("2026-05-07T13:00:00Z")
+    current = state_dir / "current.json"
+    DispatchState.cold_start(custom_cfg, solve_time).save(current)
+
+    seen: dict[str, object] = {}
+
+    def fake_run_one_cycle(**kwargs):
+        seen["config"] = kwargs.get("config")
+        kwargs["dispatch_out"].write_text("staged")
+        DispatchState.cold_start(
+            custom_cfg, solve_time + pd.Timedelta(hours=1),
+        ).save(kwargs["state_out"])
+        return 0
+
+    monkeypatch.setattr(daemon, "run_one_cycle", fake_run_one_cycle)
+
+    cfg = daemon.DaemonConfig(
+        forecast_dir=forecast_dir,
+        state_dir=state_dir,
+        dispatch_dir=dispatch_dir,
+        prices_source="live",
+        prices_path=None,
+        resolution="quarterhour",
+        forecast_resolution="hour",
+        scan_interval_s=2,
+    )
+
+    rc = daemon._run_one(cfg, solve_time, plant_config=custom_cfg)
+    assert rc == 0
+    assert seen["config"] is custom_cfg
+
+
+def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):
+    """When no CONFIG_FILE is set, plant_config defaults to None and
+    run_one_cycle falls back to legacy_default() inside itself."""
+    forecast_dir = tmp_path / "forecast"
+    state_dir = tmp_path / "state"
+    dispatch_dir = tmp_path / "dispatch"
+    forecast_dir.mkdir()
+    state_dir.mkdir()
+    dispatch_dir.mkdir()
+
+    solve_time = pd.Timestamp("2026-05-07T13:00:00Z")
+    _cs(solve_time).save(state_dir / "current.json")
+
+    seen: dict[str, object] = {}
+
+    def fake_run_one_cycle(**kwargs):
+        seen["config"] = kwargs.get("config")
+        kwargs["dispatch_out"].write_text("staged")
+        _cs(solve_time + pd.Timedelta(hours=1)).save(kwargs["state_out"])
+        return 0
+
+    monkeypatch.setattr(daemon, "run_one_cycle", fake_run_one_cycle)
+
+    cfg = _make_cfg(tmp_path)
+    rc = daemon._run_one(cfg, solve_time)  # no plant_config kwarg
+    assert rc == 0
+    assert seen["config"] is None
