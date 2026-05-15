@@ -129,6 +129,66 @@ def test_should_run_blocks_non_monotonic_solve_time(tmp_path):
     assert daemon._should_run(cfg, last, last_solve_time=last) is False
 
 
+def test_should_run_rejects_implausibly_future_forecast(tmp_path):
+    """Off-by-year filenames must not be processed.
+
+    A solve_time far in the future (clock-skewed writer, typo in a manual
+    drop, off-by-year bug) would otherwise advance state to that timestamp
+    and silently block every real forecast that follows.
+    """
+    cfg = _make_cfg(tmp_path)
+    solve_time = pd.Timestamp.now(tz="UTC").ceil("h") + pd.Timedelta(
+        hours=daemon.MAX_FUTURE_SKEW_HOURS + 2
+    )
+
+    assert daemon._should_run(cfg, solve_time, last_solve_time=None) is False
+
+
+def test_scan_does_not_advance_watermark_for_future_forecast(tmp_path):
+    """A bogus far-future forecast must not poison the scanner watermark.
+
+    Regression: without the cap, _scan would advance ``last_enqueued`` to the
+    far-future timestamp and every legitimate forecast afterwards would be
+    filtered out as "already seen".
+    """
+    forecast_dir = tmp_path / "forecast"
+    state_dir = tmp_path / "state"
+    dispatch_dir = tmp_path / "dispatch"
+    forecast_dir.mkdir()
+    state_dir.mkdir()
+    dispatch_dir.mkdir()
+
+    now = pd.Timestamp.now(tz="UTC").floor("h")
+    bogus = now + pd.Timedelta(hours=daemon.MAX_FUTURE_SKEW_HOURS + 24)
+    legit = now + pd.Timedelta(hours=1)
+    (forecast_dir / f"{bogus.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
+
+    cfg = daemon.DaemonConfig(
+        forecast_dir=forecast_dir,
+        state_dir=state_dir,
+        dispatch_dir=dispatch_dir,
+        prices_source="live",
+        prices_path=None,
+        resolution="quarterhour",
+        forecast_resolution="hour",
+        scan_interval_s=2,
+    )
+    work_queue: "queue.Queue[object]" = queue.Queue()
+    scan_state = daemon._ScanState()
+
+    daemon._scan(cfg, work_queue, scan_state)
+
+    assert work_queue.empty()
+    assert scan_state.last_enqueued is None
+
+    # A legitimate forecast arriving afterwards must still be picked up.
+    (forecast_dir / f"{legit.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
+    daemon._scan(cfg, work_queue, scan_state)
+
+    assert work_queue.get_nowait() == legit
+    assert scan_state.last_enqueued == legit
+
+
 def test_read_last_solve_time_treats_partial_state_as_missing(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()

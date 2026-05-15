@@ -17,12 +17,21 @@ After each successful cycle:
     - ``state/current.json`` symlink is atomically retargeted to it.
     - ``state/.heartbeat`` mtime is bumped (used by the container healthcheck).
 
-Duplicate forecasts are ignored: anything with solve_time <= last successful
-solve_time is dropped. The daemon does NOT check solve_time against wall-clock
-``now()`` — the MVP runs against a CSV-backed replay forecaster whose
-solve_times sit months in the past, and in production the live forecaster will
-publish solve_times near now anyway. The monotonicity check alone keeps the
-worker from re-running the same cycle.
+Two filters decide whether a forecast file is processed:
+
+1. **Monotonicity.** ``solve_time <= last successful solve_time`` → dropped.
+   This is the primary guard and is what lets the daemon serve both the
+   CSV-backed replay forecaster (solve_times months in the past) and a future
+   live forecaster (solve_times near now) with zero code change.
+
+2. **Future-skew cap.** ``solve_time > now + MAX_FUTURE_SKEW_HOURS`` → dropped,
+   at *both* the scan layer (so a bogus far-future file cannot win ``max()``
+   and poison the scanner watermark) and the worker layer (defense-in-depth).
+   A single off-by-year filename would otherwise advance ``last_enqueued``
+   to that timestamp and every real subsequent forecast would be filtered
+   out as "already seen". There is intentionally NO stale-floor counterpart:
+   the replay forecaster publishes timestamps months in the past and that
+   is normal, not a bug.
 """
 from __future__ import annotations
 
@@ -49,6 +58,11 @@ logger = logging.getLogger("optimization.daemon")
 FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\.parquet$")
 HEARTBEAT_NAME = ".heartbeat"
 CURRENT_NAME = "current.json"
+# Cap on how far in the future a forecast's solve_time may sit relative to
+# wall-clock now. Guards against off-by-year filenames or a clock-skewed
+# upstream writer poisoning the scanner watermark. No matching stale floor —
+# the replay forecaster legitimately produces months-old solve_times.
+MAX_FUTURE_SKEW_HOURS = 1
 SHUTDOWN_SENTINEL = object()
 DEFAULT_COMMIT_HOURS = RuntimeConfig().commit_hours
 
@@ -254,7 +268,13 @@ def _should_run(
     solve_time: pd.Timestamp,
     last_solve_time: Optional[pd.Timestamp],
 ) -> bool:
-    # Only monotonicity is enforced — no wall-clock guard. See module docstring.
+    now = pd.Timestamp.now(tz="UTC")
+    if solve_time > now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS):
+        logger.warning(
+            "skip implausibly future forecast %s (now=%s, max_future_skew=%dh)",
+            solve_time.isoformat(), now.isoformat(), MAX_FUTURE_SKEW_HOURS,
+        )
+        return False
     if last_solve_time is not None and solve_time <= last_solve_time:
         logger.info(
             "skip already-processed forecast %s (last_solve_time=%s)",
@@ -297,7 +317,13 @@ def _scan(
     Idempotent on quiet ticks: returns silently if nothing has changed since
     the last enqueue. Logs only when a new file is actually picked up.
     """
-    newest = _scan_newest_forecast(cfg.forecast_dir)
+    # Cap the candidate set so a single bogus far-future filename cannot win
+    # ``max()`` against every legitimate forecast — advancing the watermark
+    # to that timestamp would otherwise filter out everything real that
+    # follows. The worker re-validates via _should_run (defense-in-depth).
+    now = pd.Timestamp.now(tz="UTC")
+    max_ts = now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS)
+    newest = _scan_newest_forecast(cfg.forecast_dir, max_solve_time=max_ts)
     if newest is None:
         return
     last_solve_time = _read_last_solve_time(cfg.state_dir)
