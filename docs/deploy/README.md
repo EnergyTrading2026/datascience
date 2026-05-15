@@ -125,7 +125,9 @@ The helper writes the same parquet shape the optimizer expects from
 forecasting:
 
 - file: `data/forecast/<solve_time>.parquet`
-- filename timestamp: UTC with `Z` suffix, e.g. `2026-05-09T10:00:00Z.parquet`
+- filename timestamp: UTC with `Z` suffix and **hyphens** in the time portion,
+  e.g. `2026-05-09T10-00-00Z.parquet` (colons are invalid on Windows
+  filesystems; the daemon's scanner regex requires hyphens)
 - index: tz-aware `Europe/Berlin` hourly `DatetimeIndex`
 - column: `demand_mw_th`
 - default horizon: 35 hours
@@ -206,7 +208,7 @@ Two services in `docker-compose.yml`:
   this service exits 0 immediately.
 - **`optimization`** — long-running daemon. Polls `data/forecast/` every
   `SCAN_INTERVAL_S` seconds (default 2) for new `<solve_time>.parquet`
-  files (filename format `YYYY-MM-DDTHH:MM:SSZ.parquet`, UTC, Z suffix).
+  files (filename format `YYYY-MM-DDTHH-MM-SSZ.parquet`, UTC, Z suffix).
   When the newest file on disk is newer than the last enqueued/processed
   solve_time, one cycle is enqueued. Polling (rather than inotify) is
   intentional: identical behavior on Linux and macOS bind mounts, one
@@ -227,14 +229,14 @@ container at `/shared/`):
 ```
 data/
 ├── forecast/                              # input  (read-only mount)
-│   └── 2026-05-07T13:00:00Z.parquet
+│   └── 2026-05-07T13-00-00Z.parquet
 ├── state/                                 # persistent across restarts
-│   ├── current.json -> 2026-05-07T13:00:00Z.json   (symlink)
-│   ├── 2026-05-07T12:00:00Z.json
-│   ├── 2026-05-07T13:00:00Z.json
+│   ├── current.json -> 2026-05-07T13-00-00Z.json   (symlink)
+│   ├── 2026-05-07T12-00-00Z.json
+│   ├── 2026-05-07T13-00-00Z.json
 │   └── .heartbeat
 └── dispatch/                              # output
-    └── 2026-05-07T13:00:00Z.parquet
+    └── 2026-05-07T13-00-00Z.parquet
 ```
 
 State is append-only with a moving symlink from the very first deploy. Past
@@ -517,9 +519,12 @@ docker compose up -d optimization
 
 - **No SCADA / plant control feedback.** Output is advisory dispatch
   parquet files. Whatever consumes them is out of scope.
-- **No forecast pipeline.** The forecaster is a separate component that
-  drops parquet files into `data/forecast/`. If it stops, the daemon
-  simply waits — no false runs.
+- **No forecast model in this image.** The forecaster runs in a separate
+  Docker stack (`docker-compose.forecasting.yml`) that drops parquet files
+  into the same `data/forecast/` directory. If it stops, the optimization
+  daemon simply waits — no false runs. See
+  [`docs/forecasting/hourly_inference_pipeline.md`](../forecasting/hourly_inference_pipeline.md)
+  for the forecasting-side deployment.
 - **No alerting.** The healthcheck flags stale heartbeats but nothing
   pages anyone. Hook your monitoring of choice against the heartbeat
   file or the dispatch directory.

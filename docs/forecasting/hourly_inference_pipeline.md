@@ -41,3 +41,84 @@ python3 src/forecasting/run_hourly_forecast.py --solve_time "2026-03-01T12:00:00
 - `--solve_time`: The timestamp grounding the prediction. Defaults to the latest timestamp found in the data plus one hour.
 - `--horizon`: How many hours into the future to predict (default: 35).
 - `--log_metrics`: If set, evaluates the model's accuracy on the last `horizon` window and saves it to a `.json` file in the `output_dir`.
+
+## Containerized deployment
+
+The production path for the forecasting pipeline is a separate Docker stack
+(`docker-compose.forecasting.yml`) that runs alongside — but completely
+independent of — the optimization stack. The two containers communicate
+only through the shared `data/forecast/` bind mount.
+
+There is no live demand feed yet, so the container does not call
+`run_hourly_forecast.py` per cycle. Instead it runs the **replay loop**
+(`src/forecasting/replay_loop.py`), which simulates a live feed by walking
+the last `REPLAY_LOOKBACK_MONTHS` (default 3) of the historical CSV: at
+each tick the virtual `solve_time` advances by one hour, the configured
+model produces a 35h forecast from history-up-to-`solve_time`, and the
+parquet lands in `/shared/forecast/`. When the virtual clock reaches the
+end of the CSV it wraps back to the start of the lookback window.
+
+### First-time setup
+
+```bash
+git clone <repo-url> /opt/forecasting
+cd /opt/forecasting
+
+# CSV input + forecast output dirs must exist and be writable by uid 1001
+# (the non-root user the container runs as). The chown matters when the
+# directories are created by root; on a fresh personal dev box uid 1001 may
+# not exist yet — the numeric ownership is what matters, not the name.
+mkdir -p data/forecasting/raw data/forecast
+# Put the CSV in place: data/forecasting/raw/raw_data_measured_demand.csv
+sudo chown -R 1001:1001 data/forecasting/raw data/forecast
+
+docker compose -f docker-compose.forecasting.yml up -d --build
+docker compose -f docker-compose.forecasting.yml logs -f forecasting
+```
+
+On startup the loop fires one tick immediately, so a fresh container
+produces its first forecast within seconds (not after a full
+`TICK_INTERVAL_S`). Subsequent ticks run on the configured interval.
+
+### Configuration (environment variables)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `MODEL` | `combined_seasonal` | one of `daily_naive`, `weekly_naive`, `combined_seasonal` |
+| `HORIZON_HOURS` | `35` | forward forecast length per cycle |
+| `REPLAY_LOOKBACK_MONTHS` | `3` | size of the replay window before `csv_end` |
+| `TICK_INTERVAL_S` | `3600` | seconds between ticks; drop low for demos |
+| `CSV_PATH` | `/shared/forecasting/raw/raw_data_measured_demand.csv` | history CSV inside the container |
+| `FORECAST_DIR` | `/shared/forecast` | parquet output dir inside the container |
+
+### Coordination with the optimization stack
+
+- Output filenames use hyphens in the time portion
+  (`YYYY-MM-DDTHH-MM-SSZ.parquet`) to match the optimization daemon's
+  scanner regex and to stay Windows-safe — see
+  [`docs/optimization/forecast_contract.md`](../optimization/forecast_contract.md).
+- Files are written atomically (tmp + rename) so the optimization daemon
+  never sees a partial parquet when it scans concurrently.
+- The forecasting container runs as uid `1001`, the optimization container
+  as uid `1000`. Both must be able to read/write `data/forecast/`; the
+  simplest setup is `chown -R 1001:1000 data/forecast && chmod 2775
+  data/forecast` (group sticky bit so files inherit the group from the
+  directory), but any arrangement that gives both uids write access works.
+
+### Health and operations
+
+```bash
+# Pick up logs / status
+docker compose -f docker-compose.forecasting.yml ps
+docker compose -f docker-compose.forecasting.yml logs -f forecasting
+
+# Restart only the forecasting container (independent of optimization)
+docker compose -f docker-compose.forecasting.yml restart forecasting
+
+# Tear down
+docker compose -f docker-compose.forecasting.yml down
+```
+
+The healthcheck watches `data/forecast/.forecasting-heartbeat`. The replay
+loop touches it once at startup and after every successful tick; the
+container flips to `unhealthy` if no tick has succeeded in 90 minutes.
