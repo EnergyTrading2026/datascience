@@ -80,7 +80,7 @@ Notes:
   permissions (e.g. `chmod 2775 data/forecast` plus matching group
   membership) rather than loosening the daemon's mount.
 - The forecast file format and naming convention are defined in
-  [`docs/optimization/forecast_contract.md`](../optimization/forecast_contract.md).
+  [`forecast_contract.md`](./forecast_contract.md).
 
 ### Verify the install came up cleanly
 
@@ -129,7 +129,7 @@ forecasting:
   e.g. `2026-05-09T10-00-00Z.parquet` (colons are invalid on Windows
   filesystems; the daemon's scanner regex requires hyphens)
 - index: tz-aware hourly `DatetimeIndex` (UTC in practice — see
-  [`docs/optimization/forecast_contract.md`](../optimization/forecast_contract.md))
+  [`forecast_contract.md`](./forecast_contract.md))
 - column: `demand_mw_th`
 - default horizon: 35 hours
 
@@ -247,7 +247,7 @@ states stay on disk for audit and rollback.
 
 The optimizer ships with `PlantConfig.legacy_default()` baked in — a single
 heat pump, condensing boiler, CHP, and storage with the parameters listed in
-[`optimization_problem.md`](../optimization/optimization_problem.md). For the
+[`optimization_problem.md`](./optimization_problem.md). For the
 default plant **no `plant_config.json` is needed**; `optimization-backtest`,
 `optimization.run`, and the daemon all use the legacy default when no plant
 config is provided.
@@ -540,7 +540,7 @@ silently sits idle after restart.
   Docker stack (`docker-compose.forecasting.yml`) that drops parquet files
   into the same `data/forecast/` directory. If it stops, the optimization
   daemon simply waits — no false runs. See
-  [`docs/forecasting/hourly_inference_pipeline.md`](../forecasting/hourly_inference_pipeline.md)
+  [`docs/forecasting/deploy.md`](../forecasting/deploy.md)
   for the forecasting-side deployment.
 - **No alerting.** The healthcheck flags stale heartbeats but nothing
   pages anyone. Hook your monitoring of choice against the heartbeat
