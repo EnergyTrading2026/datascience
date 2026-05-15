@@ -61,8 +61,15 @@ stays green.
 
 The loop deliberately does **not** wrap. The optimization daemon enforces
 `solve_time > last_processed`; a wrap-around would re-write older solve_times
-and the daemon would silently skip them. To run the demo again, use
-`scripts/reset_demo.sh` to wipe both forecast and daemon state.
+and the daemon would silently skip them. To run the demo again from the
+start, use `scripts/reset_demo.sh` to wipe both forecast and daemon state.
+
+`virt_solve_time` is persisted to `/shared/forecast/.replay-state.json`
+after every successful tick (atomic write). A container restart — crash,
+`docker compose restart`, image rebuild — therefore **resumes from where
+it left off** rather than re-running the window from `csv_end - 3mo`. The
+state file survives the startup cleanup of stale parquets; only
+`reset_demo.sh` wipes it.
 
 ### First-time setup
 
@@ -134,27 +141,26 @@ solve_times in the window.
   slate. To also clear daemon state (required when re-running the demo from
   the beginning), use `scripts/reset_demo.sh`.
 
-### Restarting only one stack — footgun
+### Restarting only one stack
 
-The replay loop wipes the forecast directory on startup but does **not**
-touch `data/state/` (owned by the optimization daemon, separate concern).
-Consequence:
+Restarting `forecasting` alone is safe in the typical case. The replay
+state file (`/shared/forecast/.replay-state.json`) survives the startup
+cleanup, so the loop resumes at the next unprocessed `solve_time`. The
+daemon sees a contiguous stream and processes each new file in order.
 
-- If you `docker compose restart forecasting` **during** an active replay
-  (the daemon still progressing through the window), the replay restarts at
-  `csv_end - 3mo`. The daemon's `last_solve_time` is somewhere later in the
-  window — newer than the replay's first new file — so monotonicity blocks
-  every file until the replay catches up again.
-- If you restart the forecasting container **after** the replay has been
-  exhausted, the same thing happens at full magnitude: the daemon already
-  processed `csv_end - 1h`, the replay now starts at `csv_end - 3mo`, every
-  file is blocked, daemon sits idle forever.
+There is still one situation that needs operator intervention: if the
+state file is **missing or out of the current replay window** (e.g.
+someone deleted it manually, or the input CSV has been replaced with one
+whose range no longer overlaps), the loop falls back to `csv_end - 3mo`
+and logs a `WARNING`. If the daemon's `last_solve_time` is later than
+that fallback, the daemon's monotonicity check will block every new file
+and emit its own warning ("newest forecast ... is not newer than
+processed state ..."). The fix is `scripts/reset_demo.sh`, which wipes
+both sides cleanly.
 
-The daemon will log a `WARNING` ("newest forecast ... is not newer than
-processed state ...") once per blocked solve_time, so the condition is
-visible in logs. The fix is always `scripts/reset_demo.sh` (clears state
-and dispatch alongside the forecast dir). Do not restart the forecasting
-container alone unless you accept this trade-off.
+Rule of thumb: if you only restart the forecasting container, you're
+fine. If you wipe `data/forecast/` (including the state file) without
+also wiping `data/state/`, run `reset_demo.sh`.
 
 ### Health and operations
 

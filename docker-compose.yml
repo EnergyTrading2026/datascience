@@ -89,6 +89,12 @@ services:
       - ./data/state:/shared/state
       - ./data/dispatch:/shared/dispatch
       - ./data/config:/shared/config:ro
+    # Cap memory so a runaway solve cannot drag the host down. pyomo +
+    # HiGHS on a 140-slot horizon comfortably fits in a few hundred MB;
+    # 2 GB is generous headroom for pathological MILPs without exposing
+    # the host.
+    mem_limit: 2g
+    mem_reservation: 512m
     healthcheck:
       # Heartbeat is seeded during init-state and then bumped by the daemon
       # after every successful cycle. 5400s = 90 min: well past the hourly

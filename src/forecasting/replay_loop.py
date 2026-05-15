@@ -11,9 +11,14 @@ ticking so the healthcheck stays green.
 
 The loop deliberately does NOT wrap back to the start: the optimization
 daemon's monotonicity check (``solve_time > last_solve_time``) would block
-all post-wrap files, so a wrap would silently freeze the pipeline. To run
-the MVP again, clear ``data/forecast``, ``data/state`` and ``data/dispatch``
-(see ``scripts/reset_demo.sh``) and restart both stacks.
+all post-wrap files, so a wrap would silently freeze the pipeline.
+
+``virt_solve_time`` is persisted to ``FORECAST_DIR/.replay-state.json``
+after every successful tick. A container restart (crash, ``docker compose
+restart``, image rebuild) therefore resumes from where it left off rather
+than re-running the window from the start. To run the demo over from the
+beginning, clear ``data/forecast``, ``data/state`` and ``data/dispatch``
+(see ``scripts/reset_demo.sh``).
 
 Filename format uses hyphens in the time portion to match the daemon's
 scanner regex (Windows-safe).
@@ -21,6 +26,7 @@ scanner regex (Windows-safe).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -43,10 +49,11 @@ from forecasting.data_cleaning import load_and_clean_data
 from forecasting.export import export_forecast
 from forecasting.fill_missing_data import fill_missing_linear
 
-logger = logging.getLogger("forecasting.replay")
+logger = logging.getLogger(__name__)
 
 FORECAST_FILENAME_SUFFIX = ".parquet"
 HEARTBEAT_NAME = ".forecasting-heartbeat"
+REPLAY_STATE_NAME = ".replay-state.json"
 
 MODEL_REGISTRY: dict[str, Type[BaseForecaster]] = {
     "daily_naive": DailyNaiveForecaster,
@@ -60,6 +67,7 @@ class Config:
     csv_path: Path
     forecast_dir: Path
     heartbeat_path: Path
+    replay_state_path: Path
     model_name: str
     horizon_hours: int
     lookback_months: int
@@ -74,6 +82,7 @@ class Config:
             )),
             forecast_dir=forecast_dir,
             heartbeat_path=forecast_dir / HEARTBEAT_NAME,
+            replay_state_path=forecast_dir / REPLAY_STATE_NAME,
             model_name=os.environ.get("MODEL", "combined_seasonal"),
             horizon_hours=_positive_int_env("HORIZON_HOURS", "35"),
             lookback_months=_positive_int_env("REPLAY_LOOKBACK_MONTHS", "3"),
@@ -93,13 +102,26 @@ def _positive_int_env(name: str, default: str) -> int:
 
 
 class ReplayState:
-    """Walks the virtual solve_time forward through the lookback window.
+    """Walks virtual solve_time forward through ``[replay_start, csv_end]``.
 
-    No wrap-around: once ``virt_solve_time`` reaches ``csv_end`` the state
-    is exhausted and ``advance()`` returns ``None`` forever after.
+    Split into ``peek()`` and ``commit()`` so the caller can advance only
+    after a forecast has actually been written. A crash between peek and
+    commit repeats the same solve_time on the next tick rather than
+    silently dropping it.
+
+    ``virt_solve_time`` is persisted to ``state_path`` after every commit
+    (atomic ``.tmp`` + rename). On construction the file is read back; a
+    missing, corrupt or out-of-window file falls back to ``replay_start``
+    so a stale state from a different CSV cannot silently resume in the
+    wrong place.
     """
 
-    def __init__(self, csv_end: pd.Timestamp, lookback_months: int):
+    def __init__(
+        self,
+        csv_end: pd.Timestamp,
+        lookback_months: int,
+        state_path: Optional[Path] = None,
+    ):
         if lookback_months <= 0:
             raise ValueError(f"lookback_months must be positive; got {lookback_months}")
         self._csv_end = csv_end
@@ -111,11 +133,13 @@ class ReplayState:
                 f"replay_start {self._replay_start.isoformat()} is not before "
                 f"csv_end {csv_end.isoformat()}; lookback too large or csv too short"
             )
-        self.virt_solve_time = self._replay_start
+        self._state_path = state_path
+        persisted = self._load_persisted() if state_path is not None else None
+        self.virt_solve_time = persisted if persisted is not None else self._replay_start
         self._exhausted_logged = False
 
-    def advance(self) -> Optional[pd.Timestamp]:
-        """Return the next solve_time to forecast for, or None if exhausted."""
+    def peek(self) -> Optional[pd.Timestamp]:
+        """Return the current solve_time, or None if exhausted. No mutation."""
         if self.virt_solve_time >= self._csv_end:
             if not self._exhausted_logged:
                 logger.info(
@@ -124,9 +148,54 @@ class ReplayState:
                 )
                 self._exhausted_logged = True
             return None
-        current = self.virt_solve_time
-        self.virt_solve_time = current + pd.Timedelta(hours=1)
-        return current
+        return self.virt_solve_time
+
+    def commit(self) -> None:
+        """Advance by one hour and persist.
+
+        No-op once exhausted; defensive guard so a buggy caller can never
+        push virt_solve_time past csv_end into the invalid range that
+        ``_load_persisted`` rejects on next startup.
+        """
+        if self.virt_solve_time >= self._csv_end:
+            return
+        self.virt_solve_time = self.virt_solve_time + pd.Timedelta(hours=1)
+        self._persist()
+
+    def _persist(self) -> None:
+        if self._state_path is None:
+            return
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+        payload = json.dumps({"virt_solve_time": self.virt_solve_time.isoformat()})
+        tmp.write_text(payload)
+        os.replace(tmp, self._state_path)
+
+    def _load_persisted(self) -> Optional[pd.Timestamp]:
+        assert self._state_path is not None
+        if not self._state_path.exists():
+            return None
+        try:
+            data = json.loads(self._state_path.read_text())
+            ts = pd.Timestamp(data["virt_solve_time"])
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(
+                "could not read persisted replay state %s: %s; restarting from replay_start",
+                self._state_path, e,
+            )
+            return None
+        # Strict window check: a state file from a different (longer / shorter)
+        # CSV would otherwise resume at a meaningless point. csv_end is the
+        # terminal value, so use inclusive upper bound.
+        if ts < self._replay_start or ts > self._csv_end:
+            logger.warning(
+                "persisted virt_solve_time %s outside replay window [%s, %s]; "
+                "restarting from replay_start",
+                ts.isoformat(), self._replay_start.isoformat(), self._csv_end.isoformat(),
+            )
+            return None
+        logger.info("resuming replay from persisted virt_solve_time %s", ts.isoformat())
+        return ts
 
 
 def _load_history(csv_path: Path) -> pd.DataFrame:
@@ -155,11 +224,12 @@ def _touch_heartbeat(path: Path) -> None:
 
 
 def _cleanup_forecast_dir(forecast_dir: Path) -> None:
-    """Remove leftover *.parquet and the heartbeat before a fresh run.
+    """Remove leftover ``*.parquet`` and the heartbeat before a fresh run.
 
-    A previous container's files would otherwise mix with this run's output,
-    and the daemon's monotonicity check would block everything older than the
-    last-seen file from the previous run.
+    The replay-state file is intentionally NOT cleaned — that file is what
+    lets a restart resume from where it left off. Use
+    ``scripts/reset_demo.sh`` to wipe everything when you actually want to
+    start the demo over from the beginning.
     """
     if not forecast_dir.is_dir():
         return
@@ -178,14 +248,17 @@ def _cleanup_forecast_dir(forecast_dir: Path) -> None:
 
 
 def _tick(cfg: Config, history: pd.DataFrame, model: BaseForecaster, state: ReplayState) -> None:
-    solve_time = state.advance()
+    solve_time = state.peek()
     if solve_time is None:
         # Idle: bump heartbeat so the healthcheck stays green.
         _touch_heartbeat(cfg.heartbeat_path)
         return
     cycle_history = history[history.index < solve_time]
     if cycle_history.empty:
-        logger.warning("no history before %s; skipping tick", solve_time.isoformat())
+        # No usable history for this slot — advance past it. Without the
+        # commit the loop would spin forever on the same broken solve_time.
+        logger.warning("no history before %s; advancing past it", solve_time.isoformat())
+        state.commit()
         return
     logger.info(
         "tick: solve_time=%s history_rows=%d model=%s horizon=%dh",
@@ -193,6 +266,9 @@ def _tick(cfg: Config, history: pd.DataFrame, model: BaseForecaster, state: Repl
     )
     predictions = model.predict(cycle_history, solve_time, horizon=cfg.horizon_hours)
     out_path = export_forecast(predictions, solve_time, output_dir=str(cfg.forecast_dir))
+    # Commit only after a parquet is on disk. A crash before this line means
+    # the same solve_time is retried on the next tick, not silently skipped.
+    state.commit()
     _touch_heartbeat(cfg.heartbeat_path)
     logger.info("tick done: wrote %s", out_path)
 
@@ -210,21 +286,45 @@ def main() -> int:
         cfg.lookback_months, cfg.tick_interval_s,
     )
 
+    # Preflight: fail loud and early on misconfiguration so the container
+    # restart-loop carries an obvious message instead of a mid-load traceback.
+    if not cfg.csv_path.exists():
+        logger.error(
+            "CSV not found at %s — check the data/forecasting/raw bind mount",
+            cfg.csv_path,
+        )
+        return 2
+    try:
+        model = _build_model(cfg.model_name)
+    except ValueError as e:
+        logger.error("%s", e)
+        return 2
+
     history = _load_history(cfg.csv_path)
     csv_end = history.index.max()
     if pd.isna(csv_end):
         logger.error("CSV has no data after cleaning; aborting")
         return 1
-    state = ReplayState(csv_end=csv_end, lookback_months=cfg.lookback_months)
-    model = _build_model(cfg.model_name)
 
     cfg.forecast_dir.mkdir(parents=True, exist_ok=True)
+    # Cleanup deletes leftover parquet + heartbeat but preserves the
+    # replay-state file, so the ReplayState constructor below can resume.
     _cleanup_forecast_dir(cfg.forecast_dir)
+
+    state = ReplayState(
+        csv_end=csv_end,
+        lookback_months=cfg.lookback_months,
+        state_path=cfg.replay_state_path,
+    )
     _touch_heartbeat(cfg.heartbeat_path)
 
     # Fire once immediately so a fresh container produces a forecast without
-    # waiting a full tick interval.
-    _tick(cfg, history, model, state)
+    # waiting a full tick interval. Wrap in try/except so a transient failure
+    # at boot doesn't kill the container — the scheduler will retry next tick.
+    try:
+        _tick(cfg, history, model, state)
+    except Exception:
+        logger.exception("eager tick failed; scheduler will retry")
 
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(

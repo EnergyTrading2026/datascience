@@ -55,9 +55,15 @@ Optimization context lives in `docs/optimization/`: problem statement
 - Dockerized optimization service — see `docs/deploy/README.md` for the
   production daemon, first-time setup, synthetic forecast smoke test, and
   operational commands.
+- Dockerized forecasting service — see
+  `docs/forecasting/hourly_inference_pipeline.md` for the hourly replay-loop
+  container (a separate Compose stack that drops forecast parquets into the
+  same `data/forecast/` directory the optimization daemon reads).
 - `scripts/sim_forecaster.py` — local smoke-test helper that writes a
   contract-shaped forecast parquet into `data/forecast/` so the Docker daemon
   can run a full optimization cycle without the real forecasting service.
+- `scripts/reset_demo.sh` — wipe both stacks plus shared state and bring
+  them back up; required when restarting the replay demo from the beginning.
 
 ## Workflow
 

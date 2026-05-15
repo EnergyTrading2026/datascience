@@ -46,6 +46,11 @@ services:
     volumes:
       - ./data/forecasting/raw:/shared/forecasting/raw:ro
       - ./data/forecast:/shared/forecast
+    # Cap memory: CSV + cleaned history + a baseline model fit well under
+    # 200 MB. 1 GB is comfortable headroom and protects the host if a
+    # future model balloons unexpectedly.
+    mem_limit: 1g
+    mem_reservation: 256m
     healthcheck:
       # Heartbeat is seeded at container start and bumped after every
       # successful tick. 5400s = 90 min: well past the hourly cadence with
