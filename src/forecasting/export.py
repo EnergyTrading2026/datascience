@@ -49,7 +49,9 @@ def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir
 
     # Determine filepath
     os.makedirs(output_dir, exist_ok=True)
-    filename = st.strftime('%Y-%m-%dT%H:%M:%SZ.parquet')
+    # Hyphens (not colons) in the time portion so the filename is valid on
+    # Windows and matches the optimization daemon's FORECAST_FILENAME_RE.
+    filename = st.strftime('%Y-%m-%dT%H-%M-%SZ.parquet')
     filepath = os.path.join(output_dir, filename)
     
     # Export as Parquet

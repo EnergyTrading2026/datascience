@@ -103,7 +103,8 @@ cycle-based naming convention.
 
 - Forecasting must publish forecast files to `/shared/forecast/`
 - One file corresponds to one optimization cycle
-- Recommended filename format: `YYYY-MM-DDTHH:MM:SSZ.parquet`
+- Recommended filename format: `YYYY-MM-DDTHH-MM-SSZ.parquet`
+  (hyphens in the time portion — colons are invalid on Windows filesystems)
 - The timestamp in the filename is the cycle `solve_time`
 - The first timestamp inside the file should match that `solve_time`
 
