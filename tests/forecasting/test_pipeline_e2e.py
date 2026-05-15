@@ -55,7 +55,7 @@ def test_hourly_pipeline_and_parquet_contract(mock_history_csv, tmp_path):
     # 3. Assert - File creation
     assert os.path.exists(output_dir), "Output directory was not created."
     
-    expected_parquet = os.path.join(output_dir, "2026-05-05T00:00:00Z.parquet")
+    expected_parquet = os.path.join(output_dir, "2026-05-05T00-00-00Z.parquet")
     assert os.path.exists(expected_parquet), f"Expected parquet file missing: {expected_parquet}"
     
     expected_json = os.path.join(output_dir, "error_metrics_20260505T000000Z.json")
