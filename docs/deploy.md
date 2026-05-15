@@ -149,7 +149,7 @@ ls -lt data/forecast/
 ls -lt data/dispatch/
 
 # Both heartbeats fresh:
-stat -c '%Y %n' data/forecast/.forecasting-heartbeat data/state/.heartbeat
+stat -c '%Y %n' data/forecast/.heartbeat data/state/.heartbeat
 ```
 
 The healthchecks accept the heartbeats as fresh for up to 90 min. The
@@ -179,8 +179,8 @@ Defaults are baked into the Compose files; override via shell env or a
 | Var | Default | Meaning |
 |---|---|---|
 | `CONFIG_FILE` | unset (= legacy default plant) | path to `plant_config.json` for multi-asset deployments |
-| `PRICES_SOURCE` | `live` | `live` (SMARD HTTP) or `csv` (offline) |
-| `PRICES_PATH` | unset | required when `PRICES_SOURCE=csv` |
+| `PRICES_SOURCE` | `live` | `live` (SMARD HTTP) or `csv` (offline; see note) |
+| `PRICES_PATH` | unset | in-container path to the SMARD-format CSV; required when `PRICES_SOURCE=csv` |
 | `RESOLUTION` | `quarterhour` | optimizer time resolution |
 | `FORECAST_RESOLUTION` | `hour` | matches forecasting output |
 | `SCAN_INTERVAL_S` | `2` | how often the daemon polls `data/forecast/` |
@@ -200,11 +200,31 @@ writes forecasts faster than the daemon can solve them, the scanner's
 *newest-wins* logic silently skips intermediate solve_times and the
 dispatch history grows holes. ~60 s is safe; 5 s is not.
 
+### Offline prices (`PRICES_SOURCE=csv`)
+
+`docker-compose.yml` does not bind-mount a prices CSV by default — the
+`live` path (SMARD HTTP) is the production setup. To run without
+network access, add a mount to the `optimization` service's `volumes`
+and set the two envs:
+
+```yaml
+# additions to docker-compose.yml under services.optimization
+environment:
+  PRICES_SOURCE: csv
+  PRICES_PATH: /shared/smard/historical.csv
+volumes:
+  - ./data/smard:/shared/smard:ro   # add alongside the existing mounts
+```
+
+The CSV must use SMARD's semicolon-separated format and cover at least
+`[earliest solve_time, latest solve_time + HORIZON_HOURS]`.
+
 ## Services
 
 ### `forecasting-replay`
 
-Long-running. Loads `data/forecasting/raw/...csv` once at startup, then
+Long-running. Loads the CSV at `CSV_PATH` (default
+`data/forecasting/raw/raw_data_measured_demand.csv`) once at startup, then
 every `TICK_INTERVAL_S` seconds advances a virtual `solve_time` by one
 hour through `[csv_end − REPLAY_LOOKBACK_MONTHS, csv_end]` and writes the
 resulting parquet into `data/forecast/`. When the virtual clock reaches
@@ -221,8 +241,9 @@ from where it left off; only `reset_demo.sh` wipes that file.
 
 One-shot. On first deploy, seeds `data/state/current.json` (SoC full,
 all units off, min-up/down relaxed) and `data/state/.heartbeat`.
-Idempotent — exits 0 if state already exists. Re-runs on every
-`docker compose up` but does nothing after the first.
+Idempotent — exits 0 without rewriting if the state file already
+exists. Compose recreates this container whenever the image is rebuilt
+(`up -d --build`), so the noop path runs on every update.
 
 When `CONFIG_FILE` is set, the seeded state's asset IDs match the
 plant config; otherwise it falls back to `PlantConfig.legacy_default()`
@@ -273,7 +294,7 @@ data/
 │       └── raw_data_measured_demand.csv     # input (read-only)
 ├── forecast/
 │   ├── 2026-02-15T13-00-00Z.parquet         # forecasting → optimization
-│   ├── .forecasting-heartbeat                # forecasting healthcheck
+│   ├── .heartbeat                            # forecasting healthcheck
 │   └── .replay-state.json                    # replay resume marker
 ├── state/                                    # persistent across restarts
 │   ├── current.json -> 2026-02-15T13-00-00Z.json   (symlink)
@@ -305,10 +326,15 @@ optimization-write-default-config /opt/dispatch/data/config/plant_config.json
 # 2. Point compose at it (e.g. via /opt/dispatch/.env):
 echo 'CONFIG_FILE=/shared/config/plant_config.json' >> /opt/dispatch/.env
 
-# 3. Re-seed state to match the new asset IDs:
-docker compose run --rm init-state
+# 3. Stop the daemon and clear the old state. init-state is idempotent
+#    on existing files, so a re-seed only happens once the state file
+#    is gone. State is part of an MPC trajectory — discarding it for a
+#    plant-topology change is intended; the next cycle cold-starts.
+docker compose stop optimization
+rm -f data/state/current.json data/state/*.json
 
-# 4. Restart the daemon
+# 4. Re-seed state with asset IDs matching the new config, then bring
+#    the stack back up.
 docker compose up -d --build
 ```
 
@@ -317,8 +343,11 @@ asset IDs stay in sync. The daemon loads the config once at startup;
 editing the file mid-run has no effect until restart (by design — a
 half-edited config can never reach the solver).
 
-The daemon's `covers()` check refuses to start on config/state drift,
-so a forgotten re-seed fails loud rather than silently mis-dispatching.
+`state.covers(config)` is called per cycle inside `build_model`; on
+config/state drift the cycle raises `ValueError` and the daemon's
+worker logs the traceback. The daemon stays up but makes no progress
+until the state is re-seeded — fails loud instead of silently
+mis-dispatching.
 
 `plant_config.json` is JSON with a `schema_version` field; each asset
 has a globally unique string `id` that also appears in the state file.
@@ -495,8 +524,8 @@ fails, the next forecast file is a fresh attempt with fresh inputs.
 
 Both containers expose a healthcheck on a heartbeat file mtime:
 
-- Forecasting: `data/forecast/.forecasting-heartbeat`, bumped at startup
-  and after every tick (including idle ticks).
+- Forecasting: `data/forecast/.heartbeat`, bumped at startup and after
+  every tick (including idle ticks).
 - Optimization: `data/state/.heartbeat`, seeded by `init-state` and
   bumped after every successful cycle.
 

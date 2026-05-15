@@ -53,7 +53,7 @@ services:
       # Heartbeat is seeded at container start and bumped after every
       # successful tick. 5400s = 90 min: well past the hourly cadence with
       # margin for one slow cycle.
-      test: ["CMD-SHELL", "test -f /shared/forecast/.forecasting-heartbeat && test $(($(date +%s) - $(stat -c %Y /shared/forecast/.forecasting-heartbeat))) -lt 5400"]
+      test: ["CMD-SHELL", "test -f /shared/forecast/.heartbeat && test $(($(date +%s) - $(stat -c %Y /shared/forecast/.heartbeat))) -lt 5400"]
       interval: 5m
       timeout: 5s
       retries: 3

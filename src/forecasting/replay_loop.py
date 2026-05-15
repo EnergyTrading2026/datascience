@@ -52,7 +52,7 @@ from forecasting.fill_missing_data import fill_missing_linear
 logger = logging.getLogger(__name__)
 
 FORECAST_FILENAME_SUFFIX = ".parquet"
-HEARTBEAT_NAME = ".forecasting-heartbeat"
+HEARTBEAT_NAME = ".heartbeat"
 REPLAY_STATE_NAME = ".replay-state.json"
 
 MODEL_REGISTRY: dict[str, Type[BaseForecaster]] = {
