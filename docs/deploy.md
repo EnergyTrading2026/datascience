@@ -52,8 +52,10 @@ defined in [`forecast_contract.md`](./optimization/forecast_contract.md).
       the only steady-state external dependency.
     - **Build time only** (`docker compose build` / `up --build`):
       additionally `ghcr.io` (uv image), `docker.io` /
-      `registry-1.docker.io` (Python base image), `pypi.org` /
-      `files.pythonhosted.org` (Python packages).
+      `registry-1.docker.io` (Python base image + `busybox:1.36` used
+      by `forecasting-init`), `pypi.org` / `files.pythonhosted.org`
+      (Python packages). Air-gapped operators: pre-pull `busybox:1.36`
+      alongside the Python and uv images.
 - Disk: ~2 GB for both images plus growth in `data/`:
     - `data/dispatch/` ~5–10 KB/cycle → 50–100 MB/year
     - `data/state/` ~200 B/cycle → 2 MB/year

@@ -47,7 +47,10 @@ services:
       - -c
       - |
         mkdir -p /shared/forecast \
-        && chown -R 1001:1001 /shared/forecast
+        && chown 1001:1001 /shared/forecast
+    # No -R on chown: the running container only needs ownership of the
+    # directory (it creates new files inside). Recursive would clobber the
+    # ownership of any files the operator dropped in by hand for inspection.
     volumes:
       - ./data/forecast:/shared/forecast
     logging:

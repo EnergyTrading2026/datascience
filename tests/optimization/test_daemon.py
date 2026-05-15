@@ -7,6 +7,7 @@ import queue
 from dataclasses import replace
 
 import pandas as pd
+import pytest
 
 from optimization import daemon, init_state
 from optimization.config import HeatPumpParams, PlantConfig
@@ -155,6 +156,38 @@ def test_should_run_rejects_stale_forecast_when_grace_enabled(tmp_path, monkeypa
     # Forecast within the grace window still passes.
     fresh = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=1)
     assert daemon._should_run(cfg, fresh, last_solve_time=None) is True
+
+
+def test_stale_grace_hours_module_constant_is_int():
+    """Regression: STALE_GRACE_HOURS must be parsed at import time so a
+    typo crashes the daemon at startup, not at the first scan tick."""
+    assert hasattr(daemon, "STALE_GRACE_HOURS")
+    assert isinstance(daemon.STALE_GRACE_HOURS, int)
+    assert daemon.STALE_GRACE_HOURS >= 0
+
+
+def test_stale_grace_hours_default_is_zero(monkeypatch):
+    monkeypatch.delenv("STALE_GRACE_HOURS", raising=False)
+    assert daemon._stale_grace_hours_from_env() == 0
+
+
+def test_stale_grace_hours_positive_value_parses(monkeypatch):
+    monkeypatch.setenv("STALE_GRACE_HOURS", "2")
+    assert daemon._stale_grace_hours_from_env() == 2
+
+
+def test_stale_grace_hours_rejects_non_integer(monkeypatch):
+    """Fail loud on operator typo. Silent fallback would let a typo like
+    '2h' disable the floor exactly when the operator wants it enabled."""
+    monkeypatch.setenv("STALE_GRACE_HOURS", "two")
+    with pytest.raises(ValueError, match="STALE_GRACE_HOURS"):
+        daemon._stale_grace_hours_from_env()
+
+
+def test_stale_grace_hours_rejects_negative(monkeypatch):
+    monkeypatch.setenv("STALE_GRACE_HOURS", "-1")
+    with pytest.raises(ValueError, match="STALE_GRACE_HOURS"):
+        daemon._stale_grace_hours_from_env()
 
 
 def test_should_run_rejects_implausibly_future_forecast(tmp_path):

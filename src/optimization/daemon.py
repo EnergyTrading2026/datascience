@@ -72,13 +72,22 @@ MAX_FUTURE_SKEW_HOURS = 1
 # than ``now - STALE_GRACE_HOURS``. Default 0 (disabled) because the CSV
 # replay producer legitimately writes months-old solve_times. Set to a
 # positive int (e.g. 2) at live-feed cutover to reject forecasts from a
-# wedged upstream producer.
-try:
-    STALE_GRACE_HOURS = int(os.environ.get("STALE_GRACE_HOURS", "0"))
-except ValueError:
-    STALE_GRACE_HOURS = 0
-if STALE_GRACE_HOURS < 0:
-    STALE_GRACE_HOURS = 0
+# wedged upstream producer. Parsed at import so a typo crashes the daemon
+# at startup rather than silently disabling the guard mid-flight.
+def _stale_grace_hours_from_env() -> int:
+    raw = os.environ.get("STALE_GRACE_HOURS", "0")
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"STALE_GRACE_HOURS must be an integer; got {raw!r}"
+        ) from e
+    if value < 0:
+        raise ValueError(f"STALE_GRACE_HOURS must be >= 0; got {value}")
+    return value
+
+
+STALE_GRACE_HOURS = _stale_grace_hours_from_env()
 SHUTDOWN_SENTINEL = object()
 DEFAULT_COMMIT_HOURS = RuntimeConfig().commit_hours
 
