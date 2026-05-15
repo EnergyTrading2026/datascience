@@ -1,0 +1,60 @@
+# Multi-stage build for the hourly forecasting replay container.
+#
+# Mirrors the optimization Dockerfile (uv-based, slim runtime, non-root) but
+# installs the forecasting extra (apscheduler + base deps) instead of the
+# solver stack. The two containers communicate only through the shared
+# data/forecast/ bind mount; no shared image, no shared network, no
+# docker-compose entanglement.
+
+ARG PYTHON_VERSION=3.11
+ARG UV_VERSION=0.11.10
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+
+COPY --from=uv /uv /usr/local/bin/uv
+
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+
+WORKDIR /app
+
+# Third-party deps first (cached layer; only invalidated when pyproject.toml
+# or uv.lock change). --extra forecasting pulls apscheduler on top of the
+# base deps; pyomo / highspy stay out.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra forecasting --no-install-project --no-editable
+
+# Install the project itself.
+COPY src/forecasting ./src/forecasting
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --extra forecasting --no-editable
+
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/app/.venv/bin:$PATH \
+    TZ=Etc/UTC
+
+# uid 1001 so this container and the optimization one (uid 1000) don't fight
+# over file ownership on the shared bind-mount when both run on one host.
+# The chown brings forecast and forecasting/raw under the forecast user,
+# matching the volumes the compose file mounts.
+RUN groupadd --system --gid 1001 forecast \
+    && useradd --system --uid 1001 --gid forecast --home-dir /app --shell /usr/sbin/nologin forecast \
+    && mkdir -p /shared/forecast /shared/forecasting/raw \
+    && chown -R forecast:forecast /shared
+
+COPY --from=builder --chown=forecast:forecast /app/.venv /app/.venv
+
+USER forecast
+WORKDIR /app
+
+ENTRYPOINT ["python"]
+CMD ["-m", "forecasting.replay_loop"]

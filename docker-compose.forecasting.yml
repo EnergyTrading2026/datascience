@@ -1,0 +1,62 @@
+# Compose file for the hourly forecasting replay container.
+#
+# Deliberately kept as a separate stack from docker-compose.yml so the two
+# components can be deployed, restarted, and rebuilt independently. They
+# communicate purely through the shared data/forecast/ bind mount — same
+# filesystem-as-contract pattern the optimization daemon already uses.
+#
+# First-time setup:
+#     docker compose -f docker-compose.forecasting.yml up -d --build
+#
+# Updates:
+#     git pull
+#     docker compose -f docker-compose.forecasting.yml up -d --build
+#
+# What runs:
+#     forecasting   long-running replay loop. Loads
+#                   data/forecasting/raw/raw_data_measured_demand.csv once at
+#                   startup, then every TICK_INTERVAL_S seconds advances a
+#                   virtual solve_time through the last REPLAY_LOOKBACK_MONTHS
+#                   of the CSV and writes the resulting parquet into
+#                   /shared/forecast/. Wraps back to the lookback start when
+#                   it reaches the end of the CSV.
+#
+# Data layout (bind-mounted under ./data):
+#     data/forecasting/raw/  raw_data_measured_demand.csv  (input, read-only)
+#     data/forecast/         <solve_time>.parquet          (output → daemon)
+
+services:
+  forecasting:
+    build:
+      context: .
+      dockerfile: Dockerfile.forecasting
+    image: forecasting-replay:latest
+    container_name: forecasting-replay
+    restart: unless-stopped
+    environment:
+      TZ: Etc/UTC
+      CSV_PATH: /shared/forecasting/raw/raw_data_measured_demand.csv
+      FORECAST_DIR: /shared/forecast
+      MODEL: ${MODEL:-combined_seasonal}
+      HORIZON_HOURS: ${HORIZON_HOURS:-35}
+      REPLAY_LOOKBACK_MONTHS: ${REPLAY_LOOKBACK_MONTHS:-3}
+      # 3600 = real hourly cadence (matches the optimization scan). Drop to
+      # a small value (e.g. 5) for demos that need many cycles per minute.
+      TICK_INTERVAL_S: ${TICK_INTERVAL_S:-3600}
+    volumes:
+      - ./data/forecasting/raw:/shared/forecasting/raw:ro
+      - ./data/forecast:/shared/forecast
+    healthcheck:
+      # Heartbeat is seeded at container start and bumped after every
+      # successful tick. 5400s = 90 min: well past the hourly cadence with
+      # margin for one slow cycle.
+      test: ["CMD-SHELL", "test -f /shared/forecast/.forecasting-heartbeat && test $(($(date +%s) - $(stat -c %Y /shared/forecast/.forecasting-heartbeat))) -lt 5400"]
+      interval: 5m
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,53 @@
+# Per-Dockerfile .dockerignore for the forecasting image (BuildKit picks
+# this up automatically when present and falls back to .dockerignore
+# otherwise). The global .dockerignore excludes src/forecasting because it
+# is meant for the optimization image; here we need the inverse — keep
+# forecasting code in the context and drop the solver code.
+
+# VCS / IDE / OS noise
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+.DS_Store
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Local venvs / build artifacts
+.venv
+venv
+build
+dist
+*.egg-info
+src/datascience.egg-info
+
+# Caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Code that does not belong in the forecasting image
+notebooks
+tests
+scripts
+src/optimization
+docs
+
+# Local data / outputs
+data
+out
+shared
+**/*.executed.ipynb
+
+# Docker bits themselves
+Dockerfile
+Dockerfile.forecasting
+docker-compose.yml
+docker-compose.forecasting.yml
+.env
+.env.local
