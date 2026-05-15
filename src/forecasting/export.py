@@ -1,15 +1,16 @@
 import pandas as pd
 import os
 
-def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir: str = '/shared/forecasting/') -> str:
+def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir: str = '/shared/forecast/') -> str:
     """
     Exports the forecast to a parquet file following the strict forecast contract.
-    
+
     Parameters:
-    predictions (pd.Series or pd.DataFrame): The forecasted values. Must have or be convertable 
+    predictions (pd.Series or pd.DataFrame): The forecasted values. Must have or be convertable
                                              to a single column named 'demand_mw_th'.
     solve_time (pd.Timestamp): The solve time of the optimization cycle.
-    output_dir (str): Directory to save the exported forecast. Defaults to '/shared/forecasting/'.
+    output_dir (str): Directory to save the exported forecast. Defaults to '/shared/forecast/'
+                      (the optimization daemon's input directory).
     
     Returns:
     str: The path to the saved parquet file.

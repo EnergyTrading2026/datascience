@@ -160,30 +160,33 @@ solve room); the forecasting container's is 2 min.
 
 ### Environment variables
 
-Defaults are baked into the Compose files; override via shell env or a
-`.env` file at the repo root.
+Defaults are baked into the Compose files. Variables marked as
+**operator-tunable** below use the `${VAR:-default}` interpolation pattern
+in compose, so a shell env or `.env` file at the repo root overrides them.
+Variables not marked are hardcoded (paths the containers expect); changing
+them requires editing the compose file directly.
 
 **Forecasting** (`docker-compose.forecasting.yml`):
 
-| Var | Default | Meaning |
-|---|---|---|
-| `MODEL` | `combined_seasonal` | `daily_naive`, `weekly_naive`, or `combined_seasonal` |
-| `HORIZON_HOURS` | `35` | forward forecast length per cycle |
-| `REPLAY_LOOKBACK_MONTHS` | `3` | size of the replay window before `csv_end` |
-| `TICK_INTERVAL_S` | `3600` | seconds between ticks; see "Demo mode" below |
-| `CSV_PATH` | `/shared/demand_history/raw_data_measured_demand.csv` | history CSV inside the container |
-| `FORECAST_DIR` | `/shared/forecast` | parquet output dir inside the container |
+| Var | Default | Tunable | Meaning |
+|---|---|---|---|
+| `MODEL` | `combined_seasonal` | ✓ | `daily_naive`, `weekly_naive`, or `combined_seasonal` |
+| `HORIZON_HOURS` | `35` | ✓ | forward forecast length per cycle |
+| `REPLAY_LOOKBACK_MONTHS` | `3` | ✓ | size of the replay window before `csv_end` |
+| `TICK_INTERVAL_S` | `3600` | ✓ | seconds between ticks; see "Demo mode" below |
+| `CSV_PATH` | `/shared/demand_history/raw_data_measured_demand.csv` | | history CSV inside the container |
+| `FORECAST_DIR` | `/shared/forecast` | | parquet output dir inside the container |
 
 **Optimization** (`docker-compose.yml`):
 
-| Var | Default | Meaning |
-|---|---|---|
-| `CONFIG_FILE` | unset (= legacy default plant) | path to `plant_config.json` for multi-asset deployments |
-| `PRICES_SOURCE` | `live` | `live` (SMARD HTTP) or `csv` (offline; see note) |
-| `PRICES_PATH` | unset | in-container path to the SMARD-format CSV; required when `PRICES_SOURCE=csv` |
-| `RESOLUTION` | `quarterhour` | optimizer time resolution |
-| `FORECAST_RESOLUTION` | `hour` | matches forecasting output |
-| `SCAN_INTERVAL_S` | `2` | how often the daemon polls `data/forecast/` |
+| Var | Default | Tunable | Meaning |
+|---|---|---|---|
+| `CONFIG_FILE` | unset (= legacy default plant) | ✓ | path to `plant_config.json` for multi-asset deployments |
+| `PRICES_SOURCE` | `live` | ✓ | `live` (SMARD HTTP) or `csv` (offline; see note) |
+| `PRICES_PATH` | unset | | in-container path to the SMARD-format CSV; required when `PRICES_SOURCE=csv`. Not in the compose env block — set via the compose edit shown in "Offline prices" below, not via `.env`. |
+| `RESOLUTION` | `quarterhour` | ✓ | optimizer time resolution |
+| `FORECAST_RESOLUTION` | `hour` | ✓ | matches forecasting output |
+| `SCAN_INTERVAL_S` | `2` | ✓ | how often the daemon polls `data/forecast/` |
 
 ### Demo mode — speeding up the replay
 
