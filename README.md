@@ -14,12 +14,20 @@ Requires **Python ≥ 3.11**.
 ```bash
 git clone git@github.com:EnergyTrading2026/datascience.git
 cd datascience
-pip install -e .
+pip install -e '.[optimization,forecasting]'
 ```
 
-This installs the optimization stack (`numpy`, `pandas`, `pyarrow`,
-`matplotlib`, `pyomo`, `highspy`, `apscheduler`). Notebooks
-need `pip install -e '.[notebooks]'` (adds `jupyter`, `ipykernel`).
+Base deps are the shared minimum (`numpy`, `pandas`, `pyarrow`).
+Component-specific deps live behind extras so each Docker image installs
+only what it needs:
+
+- `[optimization]` — `pyomo`, `highspy`, `apscheduler` (solver stack)
+- `[forecasting]` — `apscheduler` (drives the hourly replay loop)
+- `[notebooks]` — `jupyter`, `ipykernel`, `matplotlib`
+- `[dev]` — `pytest`
+
+For local development install both component extras as shown above (or
+`pip install -e '.[optimization,forecasting,notebooks,dev]'` for everything).
 Forecasting notebooks pull in additional packages (`scikit-learn`, `statsmodels`,
 `tensorflow`, `pmdarima`, `xgboost`) that you'll need to install separately.
 
