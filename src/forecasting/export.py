@@ -53,8 +53,11 @@ def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir
     # Windows and matches the optimization daemon's FORECAST_FILENAME_RE.
     filename = st.strftime('%Y-%m-%dT%H-%M-%SZ.parquet')
     filepath = os.path.join(output_dir, filename)
-    
-    # Export as Parquet
-    df.to_parquet(filepath, engine='pyarrow')
-    
+
+    # Atomic write: parquet to a tmp sibling, then rename. Keeps the daemon
+    # from ever opening a partially-written file when it scans concurrently.
+    tmp_path = filepath + '.tmp'
+    df.to_parquet(tmp_path, engine='pyarrow')
+    os.replace(tmp_path, filepath)
+
     return filepath
