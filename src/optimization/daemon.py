@@ -29,9 +29,15 @@ Two filters decide whether a forecast file is processed:
    and poison the scanner watermark) and the worker layer (defense-in-depth).
    A single off-by-year filename would otherwise advance ``last_enqueued``
    to that timestamp and every real subsequent forecast would be filtered
-   out as "already seen". There is intentionally NO stale-floor counterpart:
-   the replay forecaster publishes timestamps months in the past and that
-   is normal, not a bug.
+   out as "already seen".
+
+3. **Stale-floor (opt-in).** ``solve_time < now - STALE_GRACE_HOURS`` → dropped,
+   *only* when ``STALE_GRACE_HOURS`` env is set to a positive integer.
+   Default 0 = disabled, which is required for the CSV replay producer
+   (it legitimately writes months-old solve_times). At live-feed cutover
+   set ``STALE_GRACE_HOURS=2`` (or similar) so a wedged upstream producer
+   feeding hours-old forecasts is rejected instead of silently driving
+   the optimizer off real-time prices.
 """
 from __future__ import annotations
 
@@ -60,9 +66,19 @@ HEARTBEAT_NAME = ".heartbeat"
 CURRENT_NAME = "current.json"
 # Cap on how far in the future a forecast's solve_time may sit relative to
 # wall-clock now. Guards against off-by-year filenames or a clock-skewed
-# upstream writer poisoning the scanner watermark. No matching stale floor —
-# the replay forecaster legitimately produces months-old solve_times.
+# upstream writer poisoning the scanner watermark.
 MAX_FUTURE_SKEW_HOURS = 1
+# Opt-in stale floor: when > 0, reject forecasts whose solve_time is older
+# than ``now - STALE_GRACE_HOURS``. Default 0 (disabled) because the CSV
+# replay producer legitimately writes months-old solve_times. Set to a
+# positive int (e.g. 2) at live-feed cutover to reject forecasts from a
+# wedged upstream producer.
+try:
+    STALE_GRACE_HOURS = int(os.environ.get("STALE_GRACE_HOURS", "0"))
+except ValueError:
+    STALE_GRACE_HOURS = 0
+if STALE_GRACE_HOURS < 0:
+    STALE_GRACE_HOURS = 0
 SHUTDOWN_SENTINEL = object()
 DEFAULT_COMMIT_HOURS = RuntimeConfig().commit_hours
 
@@ -273,6 +289,15 @@ def _should_run(
         logger.warning(
             "skip implausibly future forecast %s (now=%s, max_future_skew=%dh)",
             solve_time.isoformat(), now.isoformat(), MAX_FUTURE_SKEW_HOURS,
+        )
+        return False
+    if (
+        STALE_GRACE_HOURS > 0
+        and solve_time < now.floor("h") - pd.Timedelta(hours=STALE_GRACE_HOURS)
+    ):
+        logger.info(
+            "skip stale forecast %s (now=%s, grace=%dh)",
+            solve_time.isoformat(), now.isoformat(), STALE_GRACE_HOURS,
         )
         return False
     if last_solve_time is not None and solve_time <= last_solve_time:

@@ -129,6 +129,34 @@ def test_should_run_blocks_non_monotonic_solve_time(tmp_path):
     assert daemon._should_run(cfg, last, last_solve_time=last) is False
 
 
+def test_should_run_accepts_old_forecast_when_stale_grace_disabled(tmp_path, monkeypatch):
+    """Default (STALE_GRACE_HOURS=0): months-old solve_times pass.
+
+    Belt-and-suspenders against accidental re-introduction of the floor as
+    a hard-coded constant — the replay producer depends on this.
+    """
+    monkeypatch.setattr(daemon, "STALE_GRACE_HOURS", 0)
+    cfg = _make_cfg(tmp_path)
+    very_old = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
+    assert daemon._should_run(cfg, very_old, last_solve_time=None) is True
+
+
+def test_should_run_rejects_stale_forecast_when_grace_enabled(tmp_path, monkeypatch):
+    """With STALE_GRACE_HOURS>0 (live-feed config): old solve_times are dropped.
+
+    Models the live-feed cutover: a wedged upstream producer feeding
+    hours-old forecasts must not silently drive the optimizer off
+    real-time prices.
+    """
+    monkeypatch.setattr(daemon, "STALE_GRACE_HOURS", 2)
+    cfg = _make_cfg(tmp_path)
+    stale = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=5)
+    assert daemon._should_run(cfg, stale, last_solve_time=None) is False
+    # Forecast within the grace window still passes.
+    fresh = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=1)
+    assert daemon._should_run(cfg, fresh, last_solve_time=None) is True
+
+
 def test_should_run_rejects_implausibly_future_forecast(tmp_path):
     """Off-by-year filenames must not be processed.
 

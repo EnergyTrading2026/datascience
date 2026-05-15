@@ -27,10 +27,11 @@ here.
                                                   https://www.smard.de
 ```
 
-Three long-/short-lived containers:
+Four containers:
 
 | Service | Image | Lifecycle | Writes | Reads |
 |---|---|---|---|---|
+| `forecasting-init` | `busybox:1.36` | one-shot before each `up` | `data/forecast/` (chown) | — |
 | `forecasting-replay` | `Dockerfile.forecasting` | long-running daemon | `data/forecast/` | `data/demand_history/` |
 | `optimization-init-state` | `Dockerfile` | one-shot on first deploy | `data/state/` | `data/config/` (optional) |
 | `optimization-mpc` | `Dockerfile` | long-running daemon | `data/state/`, `data/dispatch/` | `data/forecast/`, `data/config/` |
@@ -108,6 +109,14 @@ If the host's first interactive user is uid 1000 (the Ubuntu/Debian
 default), `data/state` etc. may already be correct without `sudo`. The
 `chown` is safe to run regardless and avoids surprises on hardened
 hosts where service accounts use different uids.
+
+> **Note.** The `forecasting-init` oneshot (declared in
+> `docker-compose.forecasting.yml`) also chowns `data/forecast` to
+> 1001:1001 on every `up`, so a forgotten step still bring up a working
+> stack. Running the chown manually is still recommended: it covers
+> `data/demand_history` (which the init does not touch, since the
+> container reads it read-only) and makes the layout legible to host
+> tooling.
 
 ### 3. Put the input CSV in place
 
@@ -187,6 +196,7 @@ them requires editing the compose file directly.
 | `RESOLUTION` | `quarterhour` | ✓ | optimizer time resolution |
 | `FORECAST_RESOLUTION` | `hour` | ✓ | matches forecasting output |
 | `SCAN_INTERVAL_S` | `2` | ✓ | how often the daemon polls `data/forecast/` |
+| `STALE_GRACE_HOURS` | `0` | ✓ | opt-in stale floor (hours). 0 = disabled, required for CSV replay (months-old solve_times). Set to a positive int (e.g. `2`) at live-feed cutover so a wedged upstream producer feeding hours-old forecasts is rejected. |
 
 ### Demo mode — speeding up the replay
 
@@ -239,6 +249,24 @@ to replay from the start.
 `virt_solve_time` is persisted to `data/forecast/.replay-state.json`
 after every successful tick (atomic write). A container restart resumes
 from where it left off; only `reset_demo.sh` wipes that file.
+
+The CSV is loaded **once** at container startup and held in memory for
+the lifetime of the process — there is no file-watch. After replacing
+`raw_data_measured_demand.csv`, restart the container to pick up the
+new contents:
+
+```bash
+docker compose -f docker-compose.forecasting.yml restart forecasting
+```
+
+### `forecasting-init`
+
+One-shot, runs before `forecasting-replay` on every `up`. Ensures
+`data/forecast/` exists and is owned by uid 1001 so the non-root
+forecasting container can write to it. Exists because rootful Docker
+creates missing bind-mount targets as `root:0755`, which would block
+the first tick on a freshly-cloned host. Idempotent — the chown is
+cheap and safe to repeat.
 
 ### `optimization-init-state`
 

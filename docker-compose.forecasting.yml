@@ -10,20 +10,52 @@
 # directory; the relative bind mounts (./data/...) depend on it.
 #
 # What runs:
-#     forecasting   long-running replay loop. Loads
-#                   data/demand_history/raw_data_measured_demand.csv once at
-#                   startup, then every TICK_INTERVAL_S seconds advances a
-#                   virtual solve_time through the last REPLAY_LOOKBACK_MONTHS
-#                   of the CSV and writes the resulting parquet into
-#                   /shared/forecast/. When the virtual clock reaches csv_end
-#                   the loop idles (no wrap — the daemon's monotonicity
-#                   check would skip wrapped solve_times).
+#     forecasting-init  one-shot. Ensures /shared/forecast exists and is
+#                       owned by uid 1001 before the long-running container
+#                       starts. Mirrors the init-state pattern in
+#                       docker-compose.yml; idempotent.
+#     forecasting       long-running replay loop. Loads
+#                       data/demand_history/raw_data_measured_demand.csv once at
+#                       startup (CSV is held in memory for the lifetime of
+#                       the process; restart the container to pick up a
+#                       changed CSV), then every TICK_INTERVAL_S seconds
+#                       advances a virtual solve_time through the last
+#                       REPLAY_LOOKBACK_MONTHS of the CSV and writes the
+#                       resulting parquet into /shared/forecast/. When the
+#                       virtual clock reaches csv_end the loop idles (no
+#                       wrap — the daemon's monotonicity check would skip
+#                       wrapped solve_times).
 #
 # Data layout (bind-mounted under ./data):
 #     data/demand_history/  raw_data_measured_demand.csv  (input, read-only)
 #     data/forecast/         <solve_time>.parquet          (output → daemon)
 
 services:
+  forecasting-init:
+    # Tiny root-only oneshot that fixes ownership on the bind-mounted
+    # forecast dir. Rootful Docker creates a missing bind-mount target as
+    # root:root mode 0755; without this step the forecasting container
+    # (uid 1001) cannot write into a freshly-created data/forecast/ on a
+    # clean host. The deploy doc still recommends pre-chowning, but this
+    # turns "must remember step 2" into belt-and-suspenders.
+    image: busybox:1.36
+    container_name: forecasting-init
+    restart: "no"
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /shared/forecast \
+        && chown -R 1001:1001 /shared/forecast
+    volumes:
+      - ./data/forecast:/shared/forecast
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
   forecasting:
     build:
       context: .
@@ -31,6 +63,9 @@ services:
     image: forecasting-replay:latest
     container_name: forecasting-replay
     restart: unless-stopped
+    depends_on:
+      forecasting-init:
+        condition: service_completed_successfully
     environment:
       TZ: Etc/UTC
       CSV_PATH: /shared/demand_history/raw_data_measured_demand.csv

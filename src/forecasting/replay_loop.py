@@ -22,6 +22,12 @@ beginning, clear ``data/forecast``, ``data/state`` and ``data/dispatch``
 
 Filename format uses hyphens in the time portion to match the daemon's
 scanner regex (Windows-safe).
+
+The CSV is loaded **once** at container startup and held in memory for the
+lifetime of the process. To pick up a changed CSV, restart the container
+(``docker compose -f docker-compose.forecasting.yml restart forecasting``).
+No file-watch — the CSV is replaced rarely enough that restart is cheaper
+than another moving part.
 """
 
 from __future__ import annotations

@@ -83,6 +83,10 @@ services:
       RESOLUTION: ${RESOLUTION:-quarterhour}
       FORECAST_RESOLUTION: ${FORECAST_RESOLUTION:-hour}
       SCAN_INTERVAL_S: ${SCAN_INTERVAL_S:-2}
+      # Opt-in stale-floor (hours). 0 = disabled, required while the
+      # CSV replay producer is in use (it writes months-old solve_times).
+      # Set to a positive int at live-feed cutover.
+      STALE_GRACE_HOURS: ${STALE_GRACE_HOURS:-0}
     volumes:
       - ./data/forecast:/shared/forecast:ro
       - ./data/state:/shared/state
