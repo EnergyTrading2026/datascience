@@ -23,7 +23,7 @@ here.
    └──────────────────────────┘               └──────────────────────────┘
             ▲                                            │
             │ raw CSV (read-only)                        │ live DA prices
-   data/forecasting/raw/                                 ▼
+   data/demand_history/                                 ▼
                                                   https://www.smard.de
 ```
 
@@ -31,7 +31,7 @@ Three long-/short-lived containers:
 
 | Service | Image | Lifecycle | Writes | Reads |
 |---|---|---|---|---|
-| `forecasting-replay` | `Dockerfile.forecasting` | long-running daemon | `data/forecast/` | `data/forecasting/raw/` |
+| `forecasting-replay` | `Dockerfile.forecasting` | long-running daemon | `data/forecast/` | `data/demand_history/` |
 | `optimization-init-state` | `Dockerfile` | one-shot on first deploy | `data/state/` | `data/config/` (optional) |
 | `optimization-mpc` | `Dockerfile` | long-running daemon | `data/state/`, `data/dispatch/` | `data/forecast/`, `data/config/` |
 
@@ -81,7 +81,7 @@ mkdir -p data/forecast \
          data/state \
          data/dispatch \
          data/config \
-         data/forecasting/raw
+         data/demand_history
 ```
 
 ### 2. Set ownership
@@ -100,7 +100,7 @@ umask 022 leaves files world-readable so cross-stack *reads* work
 without any extra group setup:
 
 ```bash
-sudo chown -R 1001:1001 data/forecast data/forecasting
+sudo chown -R 1001:1001 data/forecast data/demand_history
 sudo chown -R 1000:1000 data/state data/dispatch data/config
 ```
 
@@ -113,11 +113,11 @@ hosts where service accounts use different uids.
 
 ```bash
 cp /path/to/raw_data_measured_demand.csv \
-   data/forecasting/raw/raw_data_measured_demand.csv
+   data/demand_history/raw_data_measured_demand.csv
 ```
 
 The filename matters — the replay container reads exactly
-`/shared/forecasting/raw/raw_data_measured_demand.csv` unless `CSV_PATH`
+`/shared/demand_history/raw_data_measured_demand.csv` unless `CSV_PATH`
 is overridden. If you move or rename the CSV, point `CSV_PATH` at the
 new location.
 
@@ -171,7 +171,7 @@ Defaults are baked into the Compose files; override via shell env or a
 | `HORIZON_HOURS` | `35` | forward forecast length per cycle |
 | `REPLAY_LOOKBACK_MONTHS` | `3` | size of the replay window before `csv_end` |
 | `TICK_INTERVAL_S` | `3600` | seconds between ticks; see "Demo mode" below |
-| `CSV_PATH` | `/shared/forecasting/raw/raw_data_measured_demand.csv` | history CSV inside the container |
+| `CSV_PATH` | `/shared/demand_history/raw_data_measured_demand.csv` | history CSV inside the container |
 | `FORECAST_DIR` | `/shared/forecast` | parquet output dir inside the container |
 
 **Optimization** (`docker-compose.yml`):
@@ -224,7 +224,7 @@ The CSV must use SMARD's semicolon-separated format and cover at least
 ### `forecasting-replay`
 
 Long-running. Loads the CSV at `CSV_PATH` (default
-`data/forecasting/raw/raw_data_measured_demand.csv`) once at startup, then
+`data/demand_history/raw_data_measured_demand.csv`) once at startup, then
 every `TICK_INTERVAL_S` seconds advances a virtual `solve_time` by one
 hour through `[csv_end − REPLAY_LOOKBACK_MONTHS, csv_end]` and writes the
 resulting parquet into `data/forecast/`. When the virtual clock reaches
@@ -289,11 +289,10 @@ Everything under `data/` is bind-mounted into the containers under
 
 ```
 data/
-├── forecasting/
-│   └── raw/
-│       └── raw_data_measured_demand.csv     # input (read-only)
-├── forecast/
-│   ├── 2026-02-15T13-00-00Z.parquet         # forecasting → optimization
+├── demand_history/                           # input  (read-only mount)
+│   └── raw_data_measured_demand.csv
+├── forecast/                                 # forecasting → optimization
+│   ├── 2026-02-15T13-00-00Z.parquet
 │   ├── .heartbeat                            # forecasting healthcheck
 │   └── .replay-state.json                    # replay resume marker
 ├── state/                                    # persistent across restarts
@@ -493,7 +492,7 @@ daemon's monotonicity check would otherwise refuse to re-process the
 same solve_times it has already seen; without a state wipe the daemon
 would sit idle after restart.
 
-`data/forecasting/raw/` is preserved — the CSV stays in place.
+`data/demand_history/` is preserved — the CSV stays in place.
 
 ## Failure semantics
 
@@ -516,7 +515,7 @@ fails, the next forecast file is a fresh attempt with fresh inputs.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Container exits with code 2 at startup | `CSV_PATH` not found or `MODEL` unknown | check mount + env |
-| Container restart-loops forever | Same as above, or CSV unreadable | inspect `docker compose logs forecasting`; check `data/forecasting/raw/` ownership |
+| Container restart-loops forever | Same as above, or CSV unreadable | inspect `docker compose logs forecasting`; check `data/demand_history/` ownership |
 | `replay window exhausted; idling` in logs | virtual clock reached `csv_end` | expected at the end of the window; use `reset_demo.sh` to replay |
 | Daemon idle, `newest forecast ... not newer than processed state` warning | `data/forecast/` was wiped (incl. `.replay-state.json`) without wiping `data/state/` | run `reset_demo.sh` |
 

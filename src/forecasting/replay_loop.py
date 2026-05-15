@@ -78,7 +78,7 @@ class Config:
         forecast_dir = Path(os.environ.get("FORECAST_DIR", "/shared/forecast"))
         return cls(
             csv_path=Path(os.environ.get(
-                "CSV_PATH", "/shared/forecasting/raw/raw_data_measured_demand.csv"
+                "CSV_PATH", "/shared/demand_history/raw_data_measured_demand.csv"
             )),
             forecast_dir=forecast_dir,
             heartbeat_path=forecast_dir / HEARTBEAT_NAME,
@@ -290,7 +290,7 @@ def main() -> int:
     # restart-loop carries an obvious message instead of a mid-load traceback.
     if not cfg.csv_path.exists():
         logger.error(
-            "CSV not found at %s — check the data/forecasting/raw bind mount",
+            "CSV not found at %s — check the data/demand_history bind mount",
             cfg.csv_path,
         )
         return 2

@@ -220,10 +220,8 @@ __marimo__/
 
 
 data/*
-!data/forecasting/
-data/forecasting/*
-!data/forecasting/raw/
-!data/forecasting/.gitkeep
+!data/demand_history/
+!data/demand_history/.gitkeep
 !data/optimization/
 data/optimization/*
 !data/optimization/.gitkeep
@@ -231,7 +229,6 @@ data/optimization/*
 
 # Backtest outputs
 out/
->>>>>>> cb1d68d (Align data layout with forecasting team conventions)
 
 
 shared/**/*

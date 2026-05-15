@@ -11,7 +11,7 @@
 #
 # What runs:
 #     forecasting   long-running replay loop. Loads
-#                   data/forecasting/raw/raw_data_measured_demand.csv once at
+#                   data/demand_history/raw_data_measured_demand.csv once at
 #                   startup, then every TICK_INTERVAL_S seconds advances a
 #                   virtual solve_time through the last REPLAY_LOOKBACK_MONTHS
 #                   of the CSV and writes the resulting parquet into
@@ -20,7 +20,7 @@
 #                   check would skip wrapped solve_times).
 #
 # Data layout (bind-mounted under ./data):
-#     data/forecasting/raw/  raw_data_measured_demand.csv  (input, read-only)
+#     data/demand_history/  raw_data_measured_demand.csv  (input, read-only)
 #     data/forecast/         <solve_time>.parquet          (output → daemon)
 
 services:
@@ -33,7 +33,7 @@ services:
     restart: unless-stopped
     environment:
       TZ: Etc/UTC
-      CSV_PATH: /shared/forecasting/raw/raw_data_measured_demand.csv
+      CSV_PATH: /shared/demand_history/raw_data_measured_demand.csv
       FORECAST_DIR: /shared/forecast
       MODEL: ${MODEL:-combined_seasonal}
       HORIZON_HOURS: ${HORIZON_HOURS:-35}
@@ -42,7 +42,7 @@ services:
       # a small value (e.g. 5) for demos that need many cycles per minute.
       TICK_INTERVAL_S: ${TICK_INTERVAL_S:-3600}
     volumes:
-      - ./data/forecasting/raw:/shared/forecasting/raw:ro
+      - ./data/demand_history:/shared/demand_history:ro
       - ./data/forecast:/shared/forecast
     # Cap memory: CSV + cleaned history + a baseline model fit well under
     # 200 MB. 1 GB is comfortable headroom and protects the host if a
