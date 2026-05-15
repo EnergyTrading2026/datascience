@@ -128,7 +128,8 @@ forecasting:
 - filename timestamp: UTC with `Z` suffix and **hyphens** in the time portion,
   e.g. `2026-05-09T10-00-00Z.parquet` (colons are invalid on Windows
   filesystems; the daemon's scanner regex requires hyphens)
-- index: tz-aware `Europe/Berlin` hourly `DatetimeIndex`
+- index: tz-aware hourly `DatetimeIndex` (UTC in practice — see
+  [`docs/optimization/forecast_contract.md`](../optimization/forecast_contract.md))
 - column: `demand_mw_th`
 - default horizon: 35 hours
 
@@ -514,6 +515,22 @@ cd /opt/optimization/data/state
 ln -sfn 2026-05-07T13:00:00Z.json current.json.tmp && mv current.json.tmp current.json
 docker compose up -d optimization
 ```
+
+### Full MVP reset
+
+To restart the entire demo (replay forecaster + optimization daemon) from the
+beginning of the replay window, use the bundled reset script:
+
+```bash
+scripts/reset_demo.sh           # interactive
+scripts/reset_demo.sh --yes     # non-interactive
+```
+
+This tears down both compose stacks, wipes `data/forecast/`, `data/state/`,
+and `data/dispatch/`, then rebuilds and restarts. Required because the
+daemon's monotonicity check would otherwise refuse to re-process solve_times
+it has already seen from a previous run — without a state wipe the daemon
+silently sits idle after restart.
 
 ## What this deployment does NOT do
 

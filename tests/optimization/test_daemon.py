@@ -109,58 +109,24 @@ def test_scan_does_not_re_enqueue_same_solve_time(tmp_path):
     assert work_queue.get_nowait() == solve_time
 
 
-def test_should_run_rejects_implausibly_future_forecast(tmp_path):
-    cfg = _make_cfg(tmp_path)
-    solve_time = pd.Timestamp.now(tz="UTC").ceil("h") + pd.Timedelta(
-        hours=daemon.MAX_FUTURE_SKEW_HOURS + 2
-    )
+def test_should_run_accepts_historical_solve_time(tmp_path):
+    """No wall-clock guard: a months-old solve_time must run.
 
-    assert daemon._should_run(cfg, solve_time, last_solve_time=None) is False
-
-
-def test_scan_does_not_advance_watermark_for_future_forecast(tmp_path):
-    """A bogus far-future forecast must not poison the scanner watermark.
-
-    Regression: previously _scan advanced ``last_enqueued`` before the worker
-    validated timestamps. A 2099-dated file became the eternal "newest", and
-    every legitimate forecast afterwards was filtered out as "already seen".
+    The MVP runs against a CSV-backed replay forecaster whose solve_times
+    sit months in the past. The daemon must process them; monotonicity is
+    the only invariant that matters.
     """
-    forecast_dir = tmp_path / "forecast"
-    state_dir = tmp_path / "state"
-    dispatch_dir = tmp_path / "dispatch"
-    forecast_dir.mkdir()
-    state_dir.mkdir()
-    dispatch_dir.mkdir()
+    cfg = _make_cfg(tmp_path)
+    historical = pd.Timestamp("2024-08-15T09:00:00Z")
+    assert daemon._should_run(cfg, historical, last_solve_time=None) is True
 
-    now = pd.Timestamp.now(tz="UTC").floor("h")
-    bogus = now + pd.Timedelta(hours=daemon.MAX_FUTURE_SKEW_HOURS + 24)
-    legit = now + pd.Timedelta(hours=1)
-    (forecast_dir / f"{bogus.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
 
-    cfg = daemon.DaemonConfig(
-        forecast_dir=forecast_dir,
-        state_dir=state_dir,
-        dispatch_dir=dispatch_dir,
-        prices_source="live",
-        prices_path=None,
-        resolution="quarterhour",
-        forecast_resolution="hour",
-        scan_interval_s=2,
-    )
-    work_queue: "queue.Queue[object]" = queue.Queue()
-    scan_state = daemon._ScanState()
-
-    daemon._scan(cfg, work_queue, scan_state)
-
-    assert work_queue.empty()
-    assert scan_state.last_enqueued is None
-
-    # A legitimate forecast arriving afterwards must still be picked up.
-    (forecast_dir / f"{legit.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet").write_text("")
-    daemon._scan(cfg, work_queue, scan_state)
-
-    assert work_queue.get_nowait() == legit
-    assert scan_state.last_enqueued == legit
+def test_should_run_blocks_non_monotonic_solve_time(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    last = pd.Timestamp("2024-08-15T10:00:00Z")
+    earlier = pd.Timestamp("2024-08-15T09:00:00Z")
+    assert daemon._should_run(cfg, earlier, last_solve_time=last) is False
+    assert daemon._should_run(cfg, last, last_solve_time=last) is False
 
 
 def test_read_last_solve_time_treats_partial_state_as_missing(tmp_path):

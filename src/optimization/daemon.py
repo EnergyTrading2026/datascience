@@ -17,8 +17,12 @@ After each successful cycle:
     - ``state/current.json`` symlink is atomically retargeted to it.
     - ``state/.heartbeat`` mtime is bumped (used by the container healthcheck).
 
-Stale or duplicate forecasts are ignored: anything older than
-STALE_GRACE_HOURS or with solve_time <= last successful solve_time is dropped.
+Duplicate forecasts are ignored: anything with solve_time <= last successful
+solve_time is dropped. The daemon does NOT check solve_time against wall-clock
+``now()`` — the MVP runs against a CSV-backed replay forecaster whose
+solve_times sit months in the past, and in production the live forecaster will
+publish solve_times near now anyway. The monotonicity check alone keeps the
+worker from re-running the same cycle.
 """
 from __future__ import annotations
 
@@ -45,8 +49,6 @@ logger = logging.getLogger("optimization.daemon")
 FORECAST_FILENAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\.parquet$")
 HEARTBEAT_NAME = ".heartbeat"
 CURRENT_NAME = "current.json"
-STALE_GRACE_HOURS = 2  # ignore forecasts whose solve_time is older than this
-MAX_FUTURE_SKEW_HOURS = 1  # allow the next scheduled hour, reject obviously bad filenames
 SHUTDOWN_SENTINEL = object()
 DEFAULT_COMMIT_HOURS = RuntimeConfig().commit_hours
 
@@ -92,6 +94,10 @@ class _ScanState:
     successful commit, which can be tens of seconds after enqueue).
     """
     last_enqueued: Optional[pd.Timestamp] = None
+    # Throttle for "all forecasts blocked by monotonicity" warning so we don't
+    # spam every SCAN_INTERVAL_S. Holds the last blocked solve_time we warned
+    # about; reset to None when the scanner successfully enqueues again.
+    last_blocked_warning_for: Optional[pd.Timestamp] = None
 
 
 def _parse_solve_time(filename: str) -> Optional[pd.Timestamp]:
@@ -248,19 +254,7 @@ def _should_run(
     solve_time: pd.Timestamp,
     last_solve_time: Optional[pd.Timestamp],
 ) -> bool:
-    now = pd.Timestamp.now(tz="UTC")
-    if solve_time > now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS):
-        logger.warning(
-            "skip implausibly future forecast %s (now=%s, max_future_skew=%dh)",
-            solve_time.isoformat(), now.isoformat(), MAX_FUTURE_SKEW_HOURS,
-        )
-        return False
-    if solve_time < now.floor("h") - pd.Timedelta(hours=STALE_GRACE_HOURS):
-        logger.info(
-            "skip stale forecast %s (now=%s, grace=%dh)",
-            solve_time.isoformat(), now.isoformat(), STALE_GRACE_HOURS,
-        )
-        return False
+    # Only monotonicity is enforced — no wall-clock guard. See module docstring.
     if last_solve_time is not None and solve_time <= last_solve_time:
         logger.info(
             "skip already-processed forecast %s (last_solve_time=%s)",
@@ -303,23 +297,31 @@ def _scan(
     Idempotent on quiet ticks: returns silently if nothing has changed since
     the last enqueue. Logs only when a new file is actually picked up.
     """
-    # Cap the candidate set to plausibly-current filenames. A single
-    # bogus far-future file otherwise wins ``max()`` against every legitimate
-    # forecast in the same directory — and advancing the watermark to that
-    # timestamp would then filter out everything real that follows.
-    now = pd.Timestamp.now(tz="UTC")
-    max_ts = now.ceil("h") + pd.Timedelta(hours=MAX_FUTURE_SKEW_HOURS)
-    newest = _scan_newest_forecast(cfg.forecast_dir, max_solve_time=max_ts)
+    newest = _scan_newest_forecast(cfg.forecast_dir)
     if newest is None:
         return
     last_solve_time = _read_last_solve_time(cfg.state_dir)
     if last_solve_time is not None and newest <= last_solve_time:
+        # Diagnostic: a forecast file exists but is older than what state
+        # already records. Most likely cause: the forecast producer was reset
+        # (e.g. the replay loop restarted from csv_end - 3mo) without also
+        # wiping data/state/. Warn once per distinct blocked solve_time so the
+        # operator sees it in the logs without spam.
+        if scan_state.last_blocked_warning_for != newest:
+            logger.warning(
+                "newest forecast %s is not newer than processed state %s — "
+                "daemon is idle. If you reset the forecaster, also reset state "
+                "(see scripts/reset_demo.sh).",
+                newest.isoformat(), last_solve_time.isoformat(),
+            )
+            scan_state.last_blocked_warning_for = newest
         return
     if scan_state.last_enqueued is not None and newest <= scan_state.last_enqueued:
         return
     logger.info("scan: enqueueing forecast %s", newest.isoformat())
     work_queue.put(newest)
     scan_state.last_enqueued = newest
+    scan_state.last_blocked_warning_for = None
 
 
 def run(argv: list[str] | None = None) -> int:

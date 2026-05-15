@@ -51,12 +51,18 @@ only through the shared `data/forecast/` bind mount.
 
 There is no live demand feed yet, so the container does not call
 `run_hourly_forecast.py` per cycle. Instead it runs the **replay loop**
-(`src/forecasting/replay_loop.py`), which simulates a live feed by walking
-the last `REPLAY_LOOKBACK_MONTHS` (default 3) of the historical CSV: at
-each tick the virtual `solve_time` advances by one hour, the configured
-model produces a 35h forecast from history-up-to-`solve_time`, and the
-parquet lands in `/shared/forecast/`. When the virtual clock reaches the
-end of the CSV it wraps back to the start of the lookback window.
+(`src/forecasting/replay_loop.py`), which walks the last
+`REPLAY_LOOKBACK_MONTHS` (default 3) of the historical CSV: at each tick the
+virtual `solve_time` advances by one hour, the configured model produces a
+35h forecast from history-up-to-`solve_time`, and the parquet lands in
+`/shared/forecast/`. When the virtual clock reaches `csv_end` the loop
+**idles** — no more forecasts, heartbeat keeps ticking so the healthcheck
+stays green.
+
+The loop deliberately does **not** wrap. The optimization daemon enforces
+`solve_time > last_processed`; a wrap-around would re-write older solve_times
+and the daemon would silently skip them. To run the demo again, use
+`scripts/reset_demo.sh` to wipe both forecast and daemon state.
 
 ### First-time setup
 
@@ -64,13 +70,15 @@ end of the CSV it wraps back to the start of the lookback window.
 git clone <repo-url> /opt/forecasting
 cd /opt/forecasting
 
-# CSV input + forecast output dirs must exist and be writable by uid 1001
-# (the non-root user the container runs as). The chown matters when the
-# directories are created by root; on a fresh personal dev box uid 1001 may
-# not exist yet — the numeric ownership is what matters, not the name.
-mkdir -p data/forecasting/raw data/forecast
+# CSV input + forecast output dirs must exist with uids that both containers
+# can write to. uid 1001 = forecasting, uid 1000 = optimization. Group sticky
+# bit lets both write to the shared forecast dir.
+mkdir -p data/forecasting/raw data/forecast data/state data/dispatch
+sudo chown -R 1001:1000 data/forecast
+sudo chmod 2775 data/forecast
+sudo chown -R 1001:1001 data/forecasting/raw
+sudo chown -R 1000:1000 data/state data/dispatch
 # Put the CSV in place: data/forecasting/raw/raw_data_measured_demand.csv
-sudo chown -R 1001:1001 data/forecasting/raw data/forecast
 
 docker compose -f docker-compose.forecasting.yml up -d --build
 docker compose -f docker-compose.forecasting.yml logs -f forecasting
@@ -79,6 +87,25 @@ docker compose -f docker-compose.forecasting.yml logs -f forecasting
 On startup the loop fires one tick immediately, so a fresh container
 produces its first forecast within seconds (not after a full
 `TICK_INTERVAL_S`). Subsequent ticks run on the configured interval.
+
+### Price source coupling
+
+The optimization daemon pulls DA prices for each cycle's solve_time. For the
+replay (historical solve_times) the daemon's default `PRICES_SOURCE=live`
+queries SMARD's chart_data API, which serves historical price buckets back
+to 2018-09 — verified to return real DA prices for any solve_time in the
+replay window. If the deployment cannot reach SMARD (offline demo,
+restricted network), switch to file mode:
+
+```bash
+# In docker-compose.yml under the optimization service:
+PRICES_SOURCE=csv
+PRICES_PATH=/shared/smard/historical.csv   # bind-mount a SMARD-format CSV
+```
+
+The CSV must cover at least `[csv_end - REPLAY_LOOKBACK_MONTHS, csv_end + HORIZON_HOURS]`,
+otherwise the daemon will fail to assemble a 35h horizon for the late
+solve_times in the window.
 
 ### Configuration (environment variables)
 
@@ -99,11 +126,35 @@ produces its first forecast within seconds (not after a full
   [`docs/optimization/forecast_contract.md`](../optimization/forecast_contract.md).
 - Files are written atomically (tmp + rename) so the optimization daemon
   never sees a partial parquet when it scans concurrently.
-- The forecasting container runs as uid `1001`, the optimization container
-  as uid `1000`. Both must be able to read/write `data/forecast/`; the
-  simplest setup is `chown -R 1001:1000 data/forecast && chmod 2775
-  data/forecast` (group sticky bit so files inherit the group from the
-  directory), but any arrangement that gives both uids write access works.
+- The daemon does not check `solve_time` against wall-clock — it consumes
+  whatever the replay writes, in order. See the "Wall-clock independence"
+  section in the forecast contract for the reasoning.
+- The replay container clears stale `*.parquet` and the heartbeat file in
+  `FORECAST_DIR` on startup, so each container start begins with a clean
+  slate. To also clear daemon state (required when re-running the demo from
+  the beginning), use `scripts/reset_demo.sh`.
+
+### Restarting only one stack — footgun
+
+The replay loop wipes the forecast directory on startup but does **not**
+touch `data/state/` (owned by the optimization daemon, separate concern).
+Consequence:
+
+- If you `docker compose restart forecasting` **during** an active replay
+  (the daemon still progressing through the window), the replay restarts at
+  `csv_end - 3mo`. The daemon's `last_solve_time` is somewhere later in the
+  window — newer than the replay's first new file — so monotonicity blocks
+  every file until the replay catches up again.
+- If you restart the forecasting container **after** the replay has been
+  exhausted, the same thing happens at full magnitude: the daemon already
+  processed `csv_end - 1h`, the replay now starts at `csv_end - 3mo`, every
+  file is blocked, daemon sits idle forever.
+
+The daemon will log a `WARNING` ("newest forecast ... is not newer than
+processed state ...") once per blocked solve_time, so the condition is
+visible in logs. The fix is always `scripts/reset_demo.sh` (clears state
+and dispatch alongside the forecast dir). Do not restart the forecasting
+container alone unless you accept this trade-off.
 
 ### Health and operations
 
@@ -117,8 +168,12 @@ docker compose -f docker-compose.forecasting.yml restart forecasting
 
 # Tear down
 docker compose -f docker-compose.forecasting.yml down
+
+# Full demo reset (both stacks + shared state)
+scripts/reset_demo.sh
 ```
 
 The healthcheck watches `data/forecast/.forecasting-heartbeat`. The replay
-loop touches it once at startup and after every successful tick; the
-container flips to `unhealthy` if no tick has succeeded in 90 minutes.
+loop touches it at startup, after every successful tick, and once per tick
+interval after the replay window is exhausted (idle mode). The container
+flips to `unhealthy` only if no heartbeat update has occurred in 90 minutes.

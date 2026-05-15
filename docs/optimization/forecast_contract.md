@@ -73,9 +73,10 @@ Optimization anchors consumption at the next valid slot boundary at or after
 hour. After loading, each hourly forecast value is applied to the four
 15-minute optimization intervals within that hour.
 
-The index only needs to be timezone-aware. The optimization code currently
-normalizes timestamps internally and does not require a specific source
-timezone for the forecast file.
+The index only needs to be timezone-aware — any IANA timezone is acceptable.
+The export helper (`src/forecasting/export.py`) normalizes to UTC before
+writing, and the optimization code aligns physical time across whatever
+timezone the file carries, so the choice is operational, not contractual.
 
 ## Coverage
 
@@ -112,6 +113,20 @@ This naming convention is part of the artifact handoff contract between the
 two components. It provides a simple and unambiguous way to identify which
 forecast belongs to which optimization cycle and where optimization should
 look for incoming forecast artifacts.
+
+### Wall-clock independence
+
+The daemon does **not** compare `solve_time` against wall-clock `now()`. It
+processes forecast files in `solve_time` order and runs each cycle exactly
+once (monotonicity check: a forecast with `solve_time <= last_processed` is
+dropped). This is what lets the same daemon serve the CSV-backed replay
+forecaster (solve_times months in the past) and a future live forecaster
+(solve_times near now) with zero code change.
+
+Implication: if you load an old forecast file into `/shared/forecast/` and
+the daemon's state is fresh, it will be processed. Always wipe `data/state/`
+and `data/dispatch/` when starting a new replay run — see
+`scripts/reset_demo.sh`.
 
 ## Consumer Guarantees
 

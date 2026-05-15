@@ -34,6 +34,13 @@ COPY src/forecasting ./src/forecasting
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --extra forecasting --no-editable
 
+# Drop optimization-* console scripts that uv installed from pyproject.toml's
+# [project.scripts]. They reference modules in src/optimization which is not
+# in this image — invoking them would fail with ImportError. They are unused
+# at runtime (entrypoint is python -m forecasting.replay_loop); removing them
+# avoids a confusing "looks broken" finding in image audits.
+RUN rm -f /app/.venv/bin/optimization-*
+
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 
