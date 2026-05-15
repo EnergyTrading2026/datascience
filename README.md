@@ -33,7 +33,7 @@ Forecasting notebooks pull in additional packages (`scikit-learn`, `statsmodels`
 
 This editable install is the intended setup for local development and tests.
 The intended production path for both services is Docker — see
-`docs/optimization/deploy.md` and `docs/forecasting/deploy.md`.
+[`docs/deploy.md`](docs/deploy.md) for the combined deployment runbook.
 
 ## Project Structure
 
@@ -52,14 +52,10 @@ Optimization context lives in `docs/optimization/`: problem statement
 
 - `optimization-backtest` — runs the hourly MPC backtest harness
   (defined in `pyproject.toml`, see `src/optimization/backtest.py`).
-- Dockerized optimization service — see `docs/optimization/deploy.md` for
-  the production daemon, first-time setup, synthetic forecast smoke test,
-  and operational commands.
-- Dockerized forecasting service — see `docs/forecasting/deploy.md` for
-  the hourly replay-loop container (a separate Compose stack that drops
-  forecast parquets into the same `data/forecast/` directory the
-  optimization daemon reads). Design notes live next to it in
-  `docs/forecasting/hourly_inference_pipeline.md`.
+- Dockerized dispatch pipeline (forecasting replay + optimization daemon)
+  — see [`docs/deploy.md`](docs/deploy.md) for first-time setup, services,
+  configuration, operations, and failure modes. Forecasting design notes
+  live in [`docs/forecasting/hourly_inference_pipeline.md`](docs/forecasting/hourly_inference_pipeline.md).
 - `scripts/sim_forecaster.py` — local smoke-test helper that writes a
   contract-shaped forecast parquet into `data/forecast/` so the Docker daemon
   can run a full optimization cycle without the real forecasting service.

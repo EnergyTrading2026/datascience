@@ -49,9 +49,6 @@ stack (`docker-compose.forecasting.yml`) running the replay loop
 (`src/forecasting/replay_loop.py`). Operational details — first-time
 host setup, configuration env vars, restart behavior, healthcheck
 semantics, coordination with the optimization stack — live in the
-dedicated runbook:
+combined deployment runbook:
 
-→ [`docs/forecasting/deploy.md`](./deploy.md)
-
-The optimization-side counterpart is
-[`docs/optimization/deploy.md`](../optimization/deploy.md).
+→ [`docs/deploy.md`](../deploy.md)
