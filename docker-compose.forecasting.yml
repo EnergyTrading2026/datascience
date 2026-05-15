@@ -5,12 +5,9 @@
 # communicate purely through the shared data/forecast/ bind mount — same
 # filesystem-as-contract pattern the optimization daemon already uses.
 #
-# First-time setup:
-#     docker compose -f docker-compose.forecasting.yml up -d --build
-#
-# Updates:
-#     git pull
-#     docker compose -f docker-compose.forecasting.yml up -d --build
+# Combined deployment (this stack + docker-compose.yml) is documented in
+# docs/deploy.md — invoke both compose files from the same working
+# directory; the relative bind mounts (./data/...) depend on it.
 #
 # What runs:
 #     forecasting   long-running replay loop. Loads
@@ -18,8 +15,9 @@
 #                   startup, then every TICK_INTERVAL_S seconds advances a
 #                   virtual solve_time through the last REPLAY_LOOKBACK_MONTHS
 #                   of the CSV and writes the resulting parquet into
-#                   /shared/forecast/. Wraps back to the lookback start when
-#                   it reaches the end of the CSV.
+#                   /shared/forecast/. When the virtual clock reaches csv_end
+#                   the loop idles (no wrap — the daemon's monotonicity
+#                   check would skip wrapped solve_times).
 #
 # Data layout (bind-mounted under ./data):
 #     data/forecasting/raw/  raw_data_measured_demand.csv  (input, read-only)

@@ -1,13 +1,8 @@
 # Compose file for the hourly MPC optimizer.
 #
-# First-time setup on a fresh Linux server:
-#     git clone <repo> /opt/optimization
-#     cd /opt/optimization
-#     docker compose up -d --build
-#
-# Updates:
-#     git pull
-#     docker compose up -d --build
+# Combined deployment (this stack + docker-compose.forecasting.yml) is
+# documented in docs/deploy.md — invoke both compose files from the same
+# working directory; the relative bind mounts (./data/...) depend on it.
 #
 # What runs:
 #     init-state    one-shot, seeds data/state/current.json on first deploy.
@@ -18,10 +13,14 @@
 #                   (rather than inotify) is intentional: identical behavior
 #                   on Linux and macOS, one mechanism, no platform quirks.
 #
+# Filename format is YYYY-MM-DDTHH-MM-SSZ.parquet — hyphens (not colons)
+# in the time portion so the names are valid on Windows filesystems and
+# match the daemon's scanner regex (see src/optimization/daemon.py).
+#
 # Data layout (bind-mounted under ./data):
-#     data/forecast/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (input)
+#     data/forecast/   <solve_time>.parquet            (input)
 #     data/state/      current.json + dated history    (persistent)
-#     data/dispatch/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (output)
+#     data/dispatch/   <solve_time>.parquet            (output)
 #     data/config/     plant_config.json (optional)    (input, read-only)
 #
 # Plant config (multi-asset):

@@ -362,8 +362,8 @@ A successful optimization cycle:
 
 ```
 INFO optimization.daemon: scan: enqueueing forecast 2026-02-15T13:00:00+00:00
-INFO optimization.run:    loaded state from /shared/state/current.json (SoC=180.5)
-INFO optimization.run:    hybrid mode: hourly demand forward-filled to 15-min
+INFO optimization.run:    loaded state from /shared/state/current.json (total SoC=180.5)
+INFO optimization.run:    hybrid mode: hourly demand forward-filled to 15-min, common start=2026-02-15 13:00:00+00:00
 INFO optimization.run:    horizon=140 slots (35.0h @ quarterhour); forecast=140, prices=140 available
 INFO optimization.run:    solved in 0.78s, status=optimal, objective=12345 EUR
 INFO optimization.run:    wrote dispatch -> /shared/dispatch/...parquet.tmp, state -> /shared/state/...json
