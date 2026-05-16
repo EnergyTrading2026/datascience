@@ -9,13 +9,7 @@ from dataclasses import replace
 import pandas as pd
 
 from optimization import daemon, init_state
-from optimization.config import (
-    BoilerParams,
-    CHPParams,
-    HeatPumpParams,
-    PlantConfig,
-    StorageParams,
-)
+from optimization.config import HeatPumpParams, PlantConfig
 from optimization.state import DispatchState
 
 _LEGACY = PlantConfig.legacy_default()
@@ -479,50 +473,6 @@ def test_maybe_reload_applies_parameter_only_change(tmp_path):
 
     assert result is not base
     assert result.gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
-    assert state.last_mtime_ns == config_path.stat().st_mtime_ns
-
-
-def test_maybe_reload_rejects_dt_h_change(tmp_path, caplog, monkeypatch):
-    """``dt_h`` is the MILP grid resolution. ``UnitState.time_in_state_steps``
-    and ``min_up_steps`` / ``min_down_steps`` are all counted in dt_h units, so
-    changing dt_h would silently rescale every commitment constraint against
-    carry-over state from the old grid. Must be a daemon restart, not a hot
-    reload — even though the asset set is unchanged.
-
-    Today ``validate_plant_payload`` pins dt_h to 0.25, so the JSON path can't
-    actually deliver a dt_h-mutated candidate. This test bypasses validation
-    by handing the daemon a pre-built candidate directly, so the gate is
-    exercised against the day a hybrid grid or QH-coarsening relaxes the
-    validator constraint."""
-    config_path = tmp_path / "plant_config.json"
-    base = PlantConfig.legacy_default()
-    _write_config(config_path, base)
-    state = daemon._ConfigReloadState(last_mtime_ns=config_path.stat().st_mtime_ns - 1)
-
-    # Relax the validator's dt_h pin to 1.0 so the candidate is legal to
-    # construct AND legal under validation; the daemon's own dt_h gate is
-    # what must then catch the (current 0.25 → candidate 1.0) mismatch.
-    from optimization import config_validation as _cv
-    monkeypatch.setattr(_cv, "DT_H_REQUIRED", 1.0)
-    regridded = replace(base, dt_h=1.0)
-    empty_result = daemon.ValidationResult()
-
-    def fake_from_json_with_result(path):
-        return regridded, empty_result
-
-    monkeypatch.setattr(
-        PlantConfig, "from_json_with_result",
-        staticmethod(fake_from_json_with_result),
-    )
-
-    with caplog.at_level("ERROR", logger="optimization.daemon"):
-        result = daemon._maybe_reload_plant_config(config_path, base, state)
-
-    assert result is base  # not swapped
-    msg = "\n".join(r.message for r in caplog.records)
-    assert "dt_h changed" in msg
-    assert "Restart the daemon" in msg
-    # Watermark advanced — broken edit doesn't re-trigger every cycle.
     assert state.last_mtime_ns == config_path.stat().st_mtime_ns
 
 

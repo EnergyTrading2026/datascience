@@ -275,9 +275,17 @@ docker compose up -d --build
 For ad-hoc runs outside compose, the same path can be passed directly:
 `docker run ... -e CONFIG_FILE=/shared/config/plant_config.json -v ./data/config:/shared/config:ro ...`.
 
-The daemon reads `CONFIG_FILE` once at startup and uses that PlantConfig for
-every cycle. Editing the file mid-run has no effect until the daemon is
-restarted — by design, so a half-edited config can never reach the solver.
+The daemon reads `CONFIG_FILE` at startup and re-stats it at every cycle
+boundary. Parameter-only edits (prices, efficiencies, limits, min-up/down,
+storage bounds) are picked up on the next forecast cycle without a restart.
+The swap is atomic between cycles, never inside an in-flight solve. Each
+candidate is fully validated first; a half-edited or invalid config is
+rejected with an `ERROR` log line and the daemon keeps running on the
+previously loaded config.
+
+Live reload is limited to parameter changes against the same asset id set.
+Adding, removing, or renaming assets still requires stopping the daemon,
+re-seeding state, and restarting (see below).
 
 `init-state --config-file` cold-starts a state file whose asset IDs match
 the plant config exactly. Without it, seed mode falls back to
@@ -290,12 +298,26 @@ takes the same flag.
 
 The file is plain JSON with a `schema_version` field (currently `1`); each
 asset is identified by a globally unique string `id` that also appears in
-the state file. If `plant_config.json` changes after the initial seed,
-re-seed `data/state/current.json` against the new config:
-`optimization-init-state --state-out data/state/current.json --force
---config-file data/config/plant_config.json`. The daemon's `covers()`
-check refuses to start on config/state drift, so a forgotten re-seed is
-caught loud rather than silently mis-dispatched.
+the state file. Parameter-only edits (same asset ids on both sides) do not
+need a re-seed — the in-memory PlantConfig is swapped at the next cycle
+boundary and the existing state stays valid. If the candidate would strand
+the stored SoC outside the new `[floor_mwh_th, capacity_mwh_th]` bounds the
+swap is rejected and logged, and the daemon keeps using the previous
+config.
+
+Adding, removing, or renaming an asset is a different operation: stop the
+daemon, re-seed `data/state/current.json` against the new config, then
+restart:
+
+```bash
+docker compose stop optimization
+optimization-init-state --state-out data/state/current.json --force \
+    --config-file data/config/plant_config.json
+docker compose up -d optimization
+```
+
+The daemon's `covers()` check refuses to start on config/state drift, so a
+forgotten re-seed is caught loud rather than silently mis-dispatched.
 
 ## Output schemas
 
