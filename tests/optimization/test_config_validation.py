@@ -713,3 +713,107 @@ def test_to_dict_validate_from_dict_round_trip_non_legacy():
     assert validation.ok, validation.errors
     cfg2 = PlantConfig.from_dict(payload)
     assert cfg2 == cfg
+
+
+# --------------------------------------------------------------------------- #
+# PlantConfig.same_asset_set — the gate used by the daemon to decide whether
+# a live config reload is a parameter-only change (allowed) or an asset-set
+# change (deferred to the live add/remove task).
+# --------------------------------------------------------------------------- #
+
+
+def test_same_asset_set_identical():
+    cfg = PlantConfig.legacy_default()
+    assert cfg.same_asset_set(cfg) is True
+
+
+def test_same_asset_set_true_when_only_parameters_differ():
+    """The whole point of the gate: param tweaks must pass."""
+    base = PlantConfig.legacy_default()
+    bumped = replace(
+        base,
+        gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 5.0,
+        heat_pumps=(
+            replace(base.heat_pumps[0], p_el_max_mw=base.heat_pumps[0].p_el_max_mw + 1.0),
+        ),
+        storages=(
+            replace(base.storages[0], capacity_mwh_th=base.storages[0].capacity_mwh_th + 50.0),
+        ),
+    )
+    assert base.same_asset_set(bumped) is True
+
+
+def test_same_asset_set_false_when_unit_id_renamed():
+    base = PlantConfig.legacy_default()
+    renamed = replace(
+        base,
+        heat_pumps=(replace(base.heat_pumps[0], id="hp_renamed"),),
+    )
+    assert base.same_asset_set(renamed) is False
+
+
+def test_same_asset_set_false_when_storage_id_renamed():
+    base = PlantConfig.legacy_default()
+    renamed = replace(
+        base,
+        storages=(replace(base.storages[0], id="storage_renamed"),),
+    )
+    assert base.same_asset_set(renamed) is False
+
+
+def test_same_asset_set_false_when_asset_added():
+    base = PlantConfig.legacy_default()
+    grown = replace(
+        base,
+        heat_pumps=base.heat_pumps + (
+            HeatPumpParams(id="hp_new", p_el_min_mw=1.0, p_el_max_mw=4.0, cop=3.5),
+        ),
+    )
+    assert base.same_asset_set(grown) is False
+    assert grown.same_asset_set(base) is False  # symmetric
+
+
+def test_same_asset_set_false_when_id_moves_between_families():
+    """Same string id used in a different family is not the same asset.
+
+    Per-family state schemas differ (UnitState vs StorageState), so the daemon
+    must treat 'storage' as a storage and refuse to silently rehome it as a
+    boiler with the same id.
+    """
+    base = PlantConfig.legacy_default()
+    # Rebuild with the boiler's id reused as a (new) CHP id, with the original
+    # boiler dropped — same set of strings, different family membership.
+    moved = replace(
+        base,
+        boilers=(),
+        chps=base.chps + (
+            CHPParams(
+                id=base.boilers[0].id,
+                p_el_min_mw=1.0, p_el_max_mw=4.0,
+                eff_el=0.4, eff_th=0.4,
+                min_up_steps=4, min_down_steps=4,
+                startup_cost_eur=100.0,
+            ),
+        ),
+    )
+    assert base.same_asset_set(moved) is False
+
+
+def test_same_asset_set_handles_empty_families():
+    """A customer with no CHP should still compare cleanly."""
+    cfg = PlantConfig(
+        dt_h=0.25,
+        gas_price_eur_mwh_hs=35.0,
+        co2_factor_t_per_mwh_hs=0.201,
+        co2_price_eur_per_t=60.0,
+        heat_pumps=(HeatPumpParams(id="hp", p_el_min_mw=1.0, p_el_max_mw=8.0, cop=3.5),),
+        boilers=(),
+        chps=(),
+        storages=(
+            StorageParams(id="s", capacity_mwh_th=100.0, floor_mwh_th=0.0,
+                          charge_max_mw_th=10.0, discharge_max_mw_th=10.0,
+                          loss_mwh_per_step=0.0, soc_init_mwh_th=50.0),
+        ),
+    )
+    same = replace(cfg, gas_price_eur_mwh_hs=40.0)
+    assert cfg.same_asset_set(same) is True

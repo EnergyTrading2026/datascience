@@ -211,6 +211,26 @@ class PlantConfig:
             + [c.id for c in self.chps]
         )
 
+    def same_asset_set(self, other: "PlantConfig") -> bool:
+        """True iff ``other`` has exactly the same unit and storage IDs as self.
+
+        Family membership is part of the identity: moving an id from ``boilers``
+        to ``chps`` is treated as a different asset set even if the string id
+        is reused, because the per-family state schema differs.
+
+        Used by the daemon to gate live config reloads — parameter-only changes
+        keep ``DispatchState`` valid 1:1, whereas any add/remove requires the
+        state-migration path that lives in Task 4.
+        """
+        def fam(cfg: "PlantConfig") -> tuple[frozenset[str], ...]:
+            return (
+                frozenset(hp.id for hp in cfg.heat_pumps),
+                frozenset(b.id for b in cfg.boilers),
+                frozenset(c.id for c in cfg.chps),
+                frozenset(s.id for s in cfg.storages),
+            )
+        return fam(self) == fam(other)
+
     @classmethod
     def legacy_default(cls) -> "PlantConfig":
         """The hardcoded 1-of-each-asset plant from the original spec.

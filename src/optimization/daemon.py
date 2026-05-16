@@ -19,6 +19,14 @@ After each successful cycle:
 
 Stale or duplicate forecasts are ignored: anything older than
 STALE_GRACE_HOURS or with solve_time <= last successful solve_time is dropped.
+
+Live config reload: when CONFIG_FILE is set, the worker checks the file's
+mtime at every cycle boundary. If it changed, the file is re-validated and
+the in-memory PlantConfig is swapped before the next solve. The swap is
+gated on the asset id set being unchanged — add/remove requires the state
+migration path that lives in a follow-up task. Validation errors or asset-id
+diffs are logged and the daemon keeps running on the previously-loaded
+config; in-flight solves are unaffected because the worker is single-threaded.
 """
 from __future__ import annotations
 
@@ -37,6 +45,11 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from optimization.config import PlantConfig, RuntimeConfig
+from optimization.config_validation import (
+    ConfigValidationError,
+    ValidationResult,
+    validate_plant_config,
+)
 from optimization.run import run_one_cycle
 from optimization.state import DispatchState
 
@@ -62,8 +75,10 @@ class DaemonConfig:
     forecast_resolution: str
     scan_interval_s: int
     # Path to plant_config.json, or None to use PlantConfig.legacy_default().
-    # The actual PlantConfig is loaded once at daemon start (run()) and passed
-    # to every cycle; editing this file mid-run has no effect until restart.
+    # When set, the worker re-stats this file at every cycle boundary and
+    # swaps the in-memory PlantConfig if mtime changed and the new file
+    # validates with the same asset id set. legacy_default mode has no file
+    # and so no reload.
     config_file: Optional[Path] = None
 
     @classmethod
@@ -81,6 +96,95 @@ class DaemonConfig:
             scan_interval_s=int(os.environ.get("SCAN_INTERVAL_S", "2")),
             config_file=Path(config_file_str) if config_file_str else None,
         )
+
+
+@dataclass
+class _ConfigReloadState:
+    """Tracks the mtime watermark for the in-memory PlantConfig.
+
+    Seeded at daemon start from the initial load so the first cycle does not
+    spuriously "detect" a change. Advanced unconditionally on every observed
+    mtime bump — even when the candidate config is rejected — so a broken
+    file does not get re-tried (and re-logged) every cycle until the operator
+    saves it again.
+    """
+    last_mtime_ns: Optional[int] = None
+
+
+def _format_validation_issues(result: ValidationResult) -> str:
+    lines = []
+    for issue in result.errors:
+        lines.append(f"  ERROR {issue.code} at {issue.path}: {issue.message}")
+    for issue in result.warnings:
+        lines.append(f"  WARNING {issue.code} at {issue.path}: {issue.message}")
+    return "\n".join(lines) if lines else "  (no issues)"
+
+
+def _maybe_reload_plant_config(
+    config_file: Optional[Path],
+    current: Optional[PlantConfig],
+    reload_state: _ConfigReloadState,
+) -> Optional[PlantConfig]:
+    """Re-stat ``config_file`` and swap ``current`` if it changed and validates.
+
+    Returns the PlantConfig the next cycle should use — either the freshly
+    loaded one or ``current`` unchanged. The watermark in ``reload_state`` is
+    advanced on every observed mtime change, including rejections, so a
+    broken file does not re-trigger every cycle.
+
+    Reload is rejected (and ``current`` returned) when:
+      - the new file fails ConfigValidationError (full result is logged);
+      - the new file is unreadable (missing, bad JSON);
+      - the asset id set differs from ``current`` (deferred to the live
+        add/remove task).
+    """
+    if config_file is None or current is None:
+        return current
+    try:
+        mtime_ns = config_file.stat().st_mtime_ns
+    except OSError as e:
+        logger.warning("config file %s not statable (%s); keeping current config", config_file, e)
+        return current
+    if reload_state.last_mtime_ns is not None and mtime_ns == reload_state.last_mtime_ns:
+        return current
+    reload_state.last_mtime_ns = mtime_ns
+    try:
+        candidate = PlantConfig.from_json(config_file)
+    except ConfigValidationError as e:
+        logger.error(
+            "config reload rejected for %s: validation failed\n%s",
+            config_file, _format_validation_issues(e.result),
+        )
+        return current
+    except (ValueError, OSError) as e:
+        logger.error(
+            "config reload rejected for %s: could not load (%s); keeping current config",
+            config_file, e,
+        )
+        return current
+    if not current.same_asset_set(candidate):
+        logger.error(
+            "config reload rejected for %s: asset id set changed — live add/remove "
+            "is a separate operation. Keeping current config.",
+            config_file,
+        )
+        return current
+    # Surface warnings even though the swap is going through. validate_plant_config
+    # was already run inside from_json, but the result was discarded; rerun (cheap)
+    # to capture warnings for logging.
+    warn_result = validate_plant_config(candidate)
+    if warn_result.warnings:
+        logger.warning(
+            "config reload applied with warnings:\n%s",
+            _format_validation_issues(
+                ValidationResult(errors=(), warnings=warn_result.warnings)
+            ),
+        )
+    logger.info(
+        "config reloaded from %s (parameter-only change; asset set unchanged)",
+        config_file,
+    )
+    return candidate
 
 
 @dataclass
@@ -275,7 +379,10 @@ def _worker(
     work_queue: "queue.Queue[object]",
     stop_event: threading.Event,
     plant_config: Optional[PlantConfig] = None,
+    reload_state: Optional[_ConfigReloadState] = None,
 ) -> None:
+    if reload_state is None:
+        reload_state = _ConfigReloadState()
     while not stop_event.is_set():
         item = work_queue.get()
         try:
@@ -285,6 +392,12 @@ def _worker(
             last_solve_time = _read_last_solve_time(cfg.state_dir)
             if not _should_run(cfg, solve_time, last_solve_time):
                 continue
+            # Cycle boundary: re-stat the config file and swap if a valid
+            # parameter-only change is on disk. Skipped cycles above do not
+            # observe the new config — they wouldn't have used it anyway.
+            plant_config = _maybe_reload_plant_config(
+                cfg.config_file, plant_config, reload_state,
+            )
             try:
                 _run_one(cfg, solve_time, plant_config=plant_config)
             except Exception:
@@ -346,12 +459,20 @@ def run(argv: list[str] | None = None) -> int:
             )
 
     plant_config: Optional[PlantConfig] = None
+    reload_state = _ConfigReloadState()
     if cfg.config_file is not None:
         try:
             plant_config = PlantConfig.from_json(cfg.config_file)
         except (FileNotFoundError, ValueError) as e:
             logger.error("plant config load failed (%s): %s", cfg.config_file, e)
             return 1
+        try:
+            reload_state.last_mtime_ns = cfg.config_file.stat().st_mtime_ns
+        except OSError:
+            # Should not happen — from_json just succeeded — but tolerate it so
+            # a transient stat failure does not abort startup. A None watermark
+            # means the next worker iteration will reload on first stat.
+            pass
         logger.info(
             "loaded plant config from %s (%d HPs, %d boilers, %d CHPs, %d storages)",
             cfg.config_file, len(plant_config.heat_pumps), len(plant_config.boilers),
@@ -372,7 +493,7 @@ def run(argv: list[str] | None = None) -> int:
 
     worker_thread = threading.Thread(
         target=_worker,
-        args=(cfg, work_queue, stop_event, plant_config),
+        args=(cfg, work_queue, stop_event, plant_config, reload_state),
         name="mpc-worker",
         daemon=True,
     )
