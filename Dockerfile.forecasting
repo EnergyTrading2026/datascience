@@ -51,12 +51,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # uid 1001 so this container and the optimization one (uid 1000) don't fight
 # over file ownership on the shared bind-mount when both run on one host.
-# The chown brings forecast and forecasting/raw under the forecast user,
-# matching the volumes the compose file mounts.
+# Only /shared itself is created here; the bind-mounted children
+# (/shared/forecast, /shared/demand_history) are populated at run time —
+# /shared/forecast ownership is fixed by the forecasting-init oneshot in
+# docker-compose.forecasting.yml, and /shared/demand_history is mounted
+# read-only so its ownership is irrelevant.
 RUN groupadd --system --gid 1001 forecast \
     && useradd --system --uid 1001 --gid forecast --home-dir /app --shell /usr/sbin/nologin forecast \
-    && mkdir -p /shared/forecast /shared/forecasting/raw \
-    && chown -R forecast:forecast /shared
+    && mkdir -p /shared \
+    && chown forecast:forecast /shared
 
 COPY --from=builder --chown=forecast:forecast /app/.venv /app/.venv
 

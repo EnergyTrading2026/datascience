@@ -198,7 +198,21 @@ them requires editing the compose file directly.
 | `RESOLUTION` | `quarterhour` | ✓ | optimizer time resolution |
 | `FORECAST_RESOLUTION` | `hour` | ✓ | matches forecasting output |
 | `SCAN_INTERVAL_S` | `2` | ✓ | how often the daemon polls `data/forecast/` |
-| `STALE_GRACE_HOURS` | `0` | ✓ | opt-in stale floor (hours). 0 = disabled, required for CSV replay (months-old solve_times). Set to a positive int (e.g. `2`) at live-feed cutover so a wedged upstream producer feeding hours-old forecasts is rejected. |
+| `STALE_GRACE_HOURS` | `0` | ✓ | opt-in stale floor (hours). 0 = disabled, required for CSV replay (months-old solve_times). Set to a positive int (e.g. `2`) at live-feed cutover so a wedged upstream producer feeding hours-old forecasts is rejected. **⚠️ Do NOT set this > 0 while the CSV replay forecaster is running — every forecast will be silently dropped as stale and the daemon will sit idle forever. See "Foot-gun" below.** |
+
+> **⚠️ Foot-gun: `STALE_GRACE_HOURS` and the CSV replay are mutually exclusive.**
+> The replay forecaster (`docker-compose.forecasting.yml`) writes
+> `solve_time`s that are months in the past by design — that's the whole
+> point of replaying the last 3 months. If you set `STALE_GRACE_HOURS=2`
+> (or any positive int) while the replay container is producing, every
+> single forecast will be filtered out by the daemon's stale-floor check.
+> Symptom: forecast parquets accumulate in `data/forecast/`, but
+> `data/state/current.json` never advances and `data/dispatch/` stays
+> empty — no error, just silence.
+>
+> Only flip `STALE_GRACE_HOURS` to a positive value **after** the
+> live-feed cutover, when the upstream producer is writing
+> near-wall-clock `solve_time`s.
 
 ### Demo mode — speeding up the replay
 
