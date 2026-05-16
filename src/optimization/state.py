@@ -40,7 +40,7 @@ class UnitState:
     """
 
     on: int                      # 0 or 1
-    time_in_state_steps: int     # how long the unit has been in current state
+    time_in_state_steps: int     # how long the unit has been in current state, in dt_h-sized steps
 
 
 @dataclass
@@ -179,8 +179,10 @@ class DispatchState:
         problems: list[str] = []
         storages_by_id = {s.id: s for s in config.storages}
         # SoC is a float carried through the solver; tolerate sub-Wh rounding
-        # against an integer-MWh edit. Anything beyond that is a real bound bust.
-        tol = 1e-9
+        # against an integer-MWh edit. 1e-6 MWh = 1 Wh, well below any bound
+        # an operator would set deliberately. Anything beyond that is a real
+        # bound bust.
+        tol = 1e-6
         for sid, sstate in self.storages.items():
             s = storages_by_id.get(sid)
             if s is None:

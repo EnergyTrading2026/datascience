@@ -444,6 +444,16 @@ def test_maybe_reload_returns_current_when_config_file_is_none():
     assert state.last_mtime_ns is None  # watermark untouched in disabled mode
 
 
+def test_maybe_reload_returns_current_when_current_is_none(tmp_path):
+    """legacy_default mode never loads a PlantConfig, so the worker passes
+    current=None. The reload hook must short-circuit without touching the
+    filesystem or the watermark — there is nothing to compare against."""
+    config_path = tmp_path / "plant_config.json"  # deliberately not created
+    state = daemon._ConfigReloadState()
+    assert daemon._maybe_reload_plant_config(config_path, None, state) is None
+    assert state.last_mtime_ns is None
+
+
 def test_maybe_reload_no_swap_when_mtime_unchanged(tmp_path):
     config_path = tmp_path / "plant_config.json"
     cfg = PlantConfig.legacy_default()
@@ -469,6 +479,50 @@ def test_maybe_reload_applies_parameter_only_change(tmp_path):
 
     assert result is not base
     assert result.gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
+    assert state.last_mtime_ns == config_path.stat().st_mtime_ns
+
+
+def test_maybe_reload_rejects_dt_h_change(tmp_path, caplog, monkeypatch):
+    """``dt_h`` is the MILP grid resolution. ``UnitState.time_in_state_steps``
+    and ``min_up_steps`` / ``min_down_steps`` are all counted in dt_h units, so
+    changing dt_h would silently rescale every commitment constraint against
+    carry-over state from the old grid. Must be a daemon restart, not a hot
+    reload — even though the asset set is unchanged.
+
+    Today ``validate_plant_payload`` pins dt_h to 0.25, so the JSON path can't
+    actually deliver a dt_h-mutated candidate. This test bypasses validation
+    by handing the daemon a pre-built candidate directly, so the gate is
+    exercised against the day a hybrid grid or QH-coarsening relaxes the
+    validator constraint."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    state = daemon._ConfigReloadState(last_mtime_ns=config_path.stat().st_mtime_ns - 1)
+
+    # Relax the validator's dt_h pin to 1.0 so the candidate is legal to
+    # construct AND legal under validation; the daemon's own dt_h gate is
+    # what must then catch the (current 0.25 → candidate 1.0) mismatch.
+    from optimization import config_validation as _cv
+    monkeypatch.setattr(_cv, "DT_H_REQUIRED", 1.0)
+    regridded = replace(base, dt_h=1.0)
+    empty_result = daemon.ValidationResult()
+
+    def fake_from_json_with_result(path):
+        return regridded, empty_result
+
+    monkeypatch.setattr(
+        PlantConfig, "from_json_with_result",
+        staticmethod(fake_from_json_with_result),
+    )
+
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(config_path, base, state)
+
+    assert result is base  # not swapped
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "dt_h changed" in msg
+    assert "Restart the daemon" in msg
+    # Watermark advanced — broken edit doesn't re-trigger every cycle.
     assert state.last_mtime_ns == config_path.stat().st_mtime_ns
 
 
@@ -699,6 +753,52 @@ def test_maybe_reload_rejects_when_state_infeasible_under_new_config(tmp_path, c
     assert "below new floor_mwh_th" in msg
     # Watermark advanced — broken edit doesn't re-trigger every cycle.
     assert reload_state.last_mtime_ns == config_path.stat().st_mtime_ns
+
+
+def test_maybe_reload_state_infeasibility_reject_surfaces_warnings(tmp_path, caplog):
+    """When the state-feasibility gate rejects a swap, the operator should
+    still see any warnings the candidate carried — same contract as the
+    asset-id-diff rejection. Otherwise the only signal is the bound bust
+    and the warning is lost until the operator retries."""
+    config_path = tmp_path / "plant_config.json"
+    state_path = tmp_path / "current.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    stored = base.storages[0]
+    state_dispatch = DispatchState.cold_start(base, pd.Timestamp.now(tz="UTC"))
+    state_dispatch.storages[stored.id].soc_mwh_th = stored.floor_mwh_th + 5.0
+    state_dispatch.save(state_path)
+
+    # Both: raise floor above stored SoC (state-infeasible, hard reject) AND
+    # disable discharge (legal but warning-eligible — STORAGE_DISCHARGE_DISABLED).
+    raised_floor = state_dispatch.storages[stored.id].soc_mwh_th + 10.0
+    candidate = replace(
+        base,
+        storages=(
+            replace(
+                stored,
+                floor_mwh_th=raised_floor,
+                discharge_max_mw_th=0.0,
+            ),
+        ),
+    )
+    _write_config(config_path, candidate)
+    _bump_mtime(config_path)
+    reload_state = daemon._ConfigReloadState(
+        last_mtime_ns=config_path.stat().st_mtime_ns - 1
+    )
+
+    with caplog.at_level("WARNING", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state, state_path=state_path
+        )
+
+    assert result is base
+    msg = "\n".join(r.message for r in caplog.records)
+    # The infeasibility error must be there, but so must the warning record.
+    assert "state is infeasible" in msg
+    assert "STORAGE_DISCHARGE_DISABLED" in msg
 
 
 def test_maybe_reload_state_path_none_skips_feasibility_check(tmp_path):

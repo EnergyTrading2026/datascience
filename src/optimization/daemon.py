@@ -125,9 +125,11 @@ class _ConfigReloadState:
 
 
 def _format_issues(issues: tuple[Issue, ...]) -> str:
-    """One ``severity code at path: message`` line per issue."""
-    if not issues:
-        return "  (none)"
+    """One ``severity code at path: message`` line per issue.
+
+    Callers gate on ``result.errors`` / ``result.warnings`` already, so the
+    empty case is not formatted here.
+    """
     return "\n".join(
         f"  {i.severity.upper()} {i.code} at {i.path}: {i.message}" for i in issues
     )
@@ -233,6 +235,23 @@ def _maybe_reload_plant_config(
     # equivalent. PlantConfig is a frozen dataclass so structural equality
     # covers every field that matters. Silent return keeps logs clean.
     if candidate == current:
+        return current
+
+    # dt_h is the MILP grid resolution. UnitState.time_in_state_steps is
+    # counted in dt_h units, and min_up_steps / min_down_steps are dt_h-step
+    # counts too — changing dt_h would silently rescale every commitment
+    # constraint against carry-over state from the old grid. Reject it: a
+    # grid change is a daemon restart, not a hot reload.
+    if candidate.dt_h != current.dt_h:
+        logger.error(
+            "config reload rejected for %s: dt_h changed (%s → %s). "
+            "The MILP grid resolution is not hot-swappable because "
+            "DispatchState.time_in_state_steps is measured in dt_h units. "
+            "Restart the daemon to pick up a grid change.",
+            config_file, current.dt_h, candidate.dt_h,
+        )
+        if result.warnings:
+            _log_validation_result(config_file, result, applied=False)
         return current
 
     if not current.same_asset_set(candidate):
@@ -565,7 +584,7 @@ def run(argv: list[str] | None = None) -> int:
             plant_config, reload_state.last_mtime_ns = (
                 _load_plant_config_with_watermark(cfg.config_file)
             )
-        except (FileNotFoundError, ValueError) as e:
+        except (OSError, ValueError) as e:
             logger.error("plant config load failed (%s): %s", cfg.config_file, e)
             return 1
         logger.info(
