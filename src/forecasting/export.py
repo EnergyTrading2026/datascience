@@ -1,15 +1,16 @@
 import pandas as pd
 import os
 
-def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir: str = '/shared/forecasting/') -> str:
+def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir: str = '/shared/forecast/') -> str:
     """
     Exports the forecast to a parquet file following the strict forecast contract.
-    
+
     Parameters:
-    predictions (pd.Series or pd.DataFrame): The forecasted values. Must have or be convertable 
+    predictions (pd.Series or pd.DataFrame): The forecasted values. Must have or be convertable
                                              to a single column named 'demand_mw_th'.
     solve_time (pd.Timestamp): The solve time of the optimization cycle.
-    output_dir (str): Directory to save the exported forecast. Defaults to '/shared/forecasting/'.
+    output_dir (str): Directory to save the exported forecast. Defaults to '/shared/forecast/'
+                      (the optimization daemon's input directory).
     
     Returns:
     str: The path to the saved parquet file.
@@ -49,10 +50,15 @@ def export_forecast(predictions: pd.Series, solve_time: pd.Timestamp, output_dir
 
     # Determine filepath
     os.makedirs(output_dir, exist_ok=True)
-    filename = st.strftime('%Y-%m-%dT%H:%M:%SZ.parquet')
+    # Hyphens (not colons) in the time portion so the filename is valid on
+    # Windows and matches the optimization daemon's FORECAST_FILENAME_RE.
+    filename = st.strftime('%Y-%m-%dT%H-%M-%SZ.parquet')
     filepath = os.path.join(output_dir, filename)
-    
-    # Export as Parquet
-    df.to_parquet(filepath, engine='pyarrow')
-    
+
+    # Atomic write: parquet to a tmp sibling, then rename. Keeps the daemon
+    # from ever opening a partially-written file when it scans concurrently.
+    tmp_path = filepath + '.tmp'
+    df.to_parquet(tmp_path, engine='pyarrow')
+    os.replace(tmp_path, filepath)
+
     return filepath

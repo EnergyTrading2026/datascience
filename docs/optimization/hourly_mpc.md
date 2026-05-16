@@ -67,7 +67,7 @@ The plan horizon adapts to this — `RuntimeConfig.horizon_hours_target = 35`, `
 | Aspect | V1 contract |
 |---|---|
 | Format | Parquet |
-| Index | hourly, tz-aware Europe/Berlin |
+| Index | hourly, tz-aware (any IANA tz; normalized to UTC on export) |
 | Column | `demand_mw_th` (float, MW thermal) |
 | Length | ≥ 11 h starting at the next full hour after `solve_time` |
 | NaN | not allowed |

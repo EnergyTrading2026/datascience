@@ -392,11 +392,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--start", type=_parse_ts, default=_parse_ts("2024-04-01"))
     p.add_argument("--end", type=_parse_ts, default=_parse_ts("2025-04-01"))
     # Defaults match the repo data layout established by the forecasting team
-    # (data/forecasting/raw/ for demand) and mirror that convention for prices
+    # (data/demand_history/ for demand) and mirror that convention for prices
     # (data/optimization/raw/). The forecasting team tracks the demand CSV in
     # git; the SMARD price CSV is uploaded by the optimization team.
     p.add_argument("--demand-path", type=Path,
-                   default=Path("data/forecasting/raw/raw_data_measured_demand.csv"))
+                   default=Path("data/demand_history/raw_data_measured_demand.csv"))
     p.add_argument("--prices-path", type=Path,
                    default=Path("data/optimization/raw/Gro_handelspreise_202403010000_202603020000_Stunde.csv"))
     p.add_argument("--output-dir", type=Path, default=Path("out/backtest"))

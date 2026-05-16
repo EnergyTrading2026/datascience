@@ -19,7 +19,7 @@ class DataPreparationPipeline:
     Each step can be run independently or sequenced together.
     """
 
-    default_input_path = "../../data/forecasting/raw/raw_data_measured_demand.csv"
+    default_input_path = "../../data/demand_history/raw_data_measured_demand.csv"
     default_export_dir = "../../data/forecasting"
     
     def __init__(self, input_file: Optional[str] = None, output_dir: Optional[str] = None):

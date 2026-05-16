@@ -65,7 +65,7 @@ def fill_missing_seasonal(df: pd.DataFrame, target_col: str = 'heat_demand_W') -
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    input_file = os.path.join(script_dir, "../../data/forecasting/raw_data_measured_demand.csv")
+    input_file = os.path.join(script_dir, "../../data/demand_history/raw_data_measured_demand.csv")
     output_dir = os.path.join(script_dir, "../../data/forecasting")
     
     # Ensure output directory exists (it should, but just in case)

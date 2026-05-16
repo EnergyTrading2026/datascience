@@ -448,38 +448,44 @@ name = "datascience"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "apscheduler" },
-    { name = "highspy" },
-    { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
-    { name = "pyomo" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
 ]
+forecasting = [
+    { name = "apscheduler" },
+]
 notebooks = [
     { name = "ipykernel" },
     { name = "jupyter" },
+    { name = "matplotlib" },
+]
+optimization = [
+    { name = "apscheduler" },
+    { name = "highspy" },
+    { name = "pyomo" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "apscheduler" },
-    { name = "highspy", specifier = "==1.14.0" },
+    { name = "apscheduler", marker = "extra == 'forecasting'" },
+    { name = "apscheduler", marker = "extra == 'optimization'" },
+    { name = "highspy", marker = "extra == 'optimization'", specifier = "==1.14.0" },
     { name = "ipykernel", marker = "extra == 'notebooks'" },
     { name = "jupyter", marker = "extra == 'notebooks'" },
-    { name = "matplotlib" },
+    { name = "matplotlib", marker = "extra == 'notebooks'" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
-    { name = "pyomo", specifier = "~=6.10.0" },
+    { name = "pyomo", marker = "extra == 'optimization'", specifier = "~=6.10.0" },
     { name = "pytest", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev", "notebooks"]
+provides-extras = ["optimization", "forecasting", "dev", "notebooks"]
 
 [[package]]
 name = "debugpy"

@@ -7,6 +7,7 @@ import queue
 from dataclasses import replace
 
 import pandas as pd
+import pytest
 
 from optimization import daemon, init_state
 from optimization.config import HeatPumpParams, PlantConfig
@@ -109,7 +110,93 @@ def test_scan_does_not_re_enqueue_same_solve_time(tmp_path):
     assert work_queue.get_nowait() == solve_time
 
 
+def test_should_run_accepts_historical_solve_time(tmp_path):
+    """No wall-clock guard: a months-old solve_time must run.
+
+    The MVP runs against a CSV-backed replay forecaster whose solve_times
+    sit months in the past. The daemon must process them; monotonicity is
+    the only invariant that matters.
+    """
+    cfg = _make_cfg(tmp_path)
+    historical = pd.Timestamp("2024-08-15T09:00:00Z")
+    assert daemon._should_run(cfg, historical, last_solve_time=None) is True
+
+
+def test_should_run_blocks_non_monotonic_solve_time(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    last = pd.Timestamp("2024-08-15T10:00:00Z")
+    earlier = pd.Timestamp("2024-08-15T09:00:00Z")
+    assert daemon._should_run(cfg, earlier, last_solve_time=last) is False
+    assert daemon._should_run(cfg, last, last_solve_time=last) is False
+
+
+def test_should_run_accepts_old_forecast_when_stale_grace_disabled(tmp_path, monkeypatch):
+    """Default (STALE_GRACE_HOURS=0): months-old solve_times pass.
+
+    Belt-and-suspenders against accidental re-introduction of the floor as
+    a hard-coded constant — the replay producer depends on this.
+    """
+    monkeypatch.setattr(daemon, "STALE_GRACE_HOURS", 0)
+    cfg = _make_cfg(tmp_path)
+    very_old = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
+    assert daemon._should_run(cfg, very_old, last_solve_time=None) is True
+
+
+def test_should_run_rejects_stale_forecast_when_grace_enabled(tmp_path, monkeypatch):
+    """With STALE_GRACE_HOURS>0 (live-feed config): old solve_times are dropped.
+
+    Models the live-feed cutover: a wedged upstream producer feeding
+    hours-old forecasts must not silently drive the optimizer off
+    real-time prices.
+    """
+    monkeypatch.setattr(daemon, "STALE_GRACE_HOURS", 2)
+    cfg = _make_cfg(tmp_path)
+    stale = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=5)
+    assert daemon._should_run(cfg, stale, last_solve_time=None) is False
+    # Forecast within the grace window still passes.
+    fresh = pd.Timestamp.now(tz="UTC").floor("h") - pd.Timedelta(hours=1)
+    assert daemon._should_run(cfg, fresh, last_solve_time=None) is True
+
+
+def test_stale_grace_hours_module_constant_is_int():
+    """Regression: STALE_GRACE_HOURS must be parsed at import time so a
+    typo crashes the daemon at startup, not at the first scan tick."""
+    assert hasattr(daemon, "STALE_GRACE_HOURS")
+    assert isinstance(daemon.STALE_GRACE_HOURS, int)
+    assert daemon.STALE_GRACE_HOURS >= 0
+
+
+def test_stale_grace_hours_default_is_zero(monkeypatch):
+    monkeypatch.delenv("STALE_GRACE_HOURS", raising=False)
+    assert daemon._stale_grace_hours_from_env() == 0
+
+
+def test_stale_grace_hours_positive_value_parses(monkeypatch):
+    monkeypatch.setenv("STALE_GRACE_HOURS", "2")
+    assert daemon._stale_grace_hours_from_env() == 2
+
+
+def test_stale_grace_hours_rejects_non_integer(monkeypatch):
+    """Fail loud on operator typo. Silent fallback would let a typo like
+    '2h' disable the floor exactly when the operator wants it enabled."""
+    monkeypatch.setenv("STALE_GRACE_HOURS", "two")
+    with pytest.raises(ValueError, match="STALE_GRACE_HOURS"):
+        daemon._stale_grace_hours_from_env()
+
+
+def test_stale_grace_hours_rejects_negative(monkeypatch):
+    monkeypatch.setenv("STALE_GRACE_HOURS", "-1")
+    with pytest.raises(ValueError, match="STALE_GRACE_HOURS"):
+        daemon._stale_grace_hours_from_env()
+
+
 def test_should_run_rejects_implausibly_future_forecast(tmp_path):
+    """Off-by-year filenames must not be processed.
+
+    A solve_time far in the future (clock-skewed writer, typo in a manual
+    drop, off-by-year bug) would otherwise advance state to that timestamp
+    and silently block every real forecast that follows.
+    """
     cfg = _make_cfg(tmp_path)
     solve_time = pd.Timestamp.now(tz="UTC").ceil("h") + pd.Timedelta(
         hours=daemon.MAX_FUTURE_SKEW_HOURS + 2
@@ -121,9 +208,9 @@ def test_should_run_rejects_implausibly_future_forecast(tmp_path):
 def test_scan_does_not_advance_watermark_for_future_forecast(tmp_path):
     """A bogus far-future forecast must not poison the scanner watermark.
 
-    Regression: previously _scan advanced ``last_enqueued`` before the worker
-    validated timestamps. A 2099-dated file became the eternal "newest", and
-    every legitimate forecast afterwards was filtered out as "already seen".
+    Regression: without the cap, _scan would advance ``last_enqueued`` to the
+    far-future timestamp and every legitimate forecast afterwards would be
+    filtered out as "already seen".
     """
     forecast_dir = tmp_path / "forecast"
     state_dir = tmp_path / "state"
