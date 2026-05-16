@@ -35,6 +35,14 @@ This editable install is the intended setup for local development and tests.
 The intended production path for both services is Docker — see
 [`docs/deploy.md`](docs/deploy.md) for the combined deployment runbook.
 
+> **Deploying for the first time?** Two compose files
+> (`docker-compose.yml` and `docker-compose.forecasting.yml`) must be
+> brought up from the same working directory. Before the first
+> `docker compose up`, copy `.env.example` to `.env` — the replay
+> setup will not produce any dispatch until `INIT_STATE_SOLVE_TIME`
+> is set there. Walk-through in
+> [`docs/deploy.md` §"First-time setup"](docs/deploy.md#first-time-setup).
+
 ## Project Structure
 
 ```

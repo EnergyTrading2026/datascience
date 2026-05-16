@@ -132,20 +132,24 @@ The filename matters — the replay container reads exactly
 is overridden. If you move or rename the CSV, point `CSV_PATH` at the
 new location.
 
-### 4. Set the seed timestamp for the replay setup
+### 4. Configure environment (`.env`)
 
 > **⚠️ Do this before step 5 on first deploy.** Skipping it leaves the
 > daemon idle — replay forecasts pile up but nothing gets dispatched.
 > Details in "Replay vs. live-feed timestamps" below.
 
+Copy the template and edit if needed. Both compose files pick up `.env`
+automatically when invoked from the same working directory.
+
 ```bash
-# /opt/dispatch/.env
-echo 'INIT_STATE_SOLVE_TIME=2025-12-01T00:00:00Z' >> .env
+cp .env.example .env
+# .env already has INIT_STATE_SOLVE_TIME=2025-12-01T00:00:00Z preset
+# for the bundled CSV. Adjust the value if csv_end has shifted.
 ```
 
-Pick any tz-aware ISO timestamp older than `csv_end − 3 months`. With
-the bundled CSV that's `2025-12-01T00:00:00Z`. **Unset at live-feed
-cutover.**
+`INIT_STATE_SOLVE_TIME` must be a tz-aware ISO timestamp older than
+`csv_end − 3 months`. **Unset it at live-feed cutover** (delete the
+line from `.env`).
 
 ### 5. Start both stacks
 
