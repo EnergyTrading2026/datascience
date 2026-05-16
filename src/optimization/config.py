@@ -30,6 +30,7 @@ from optimization.config_validation import (
     DT_H_REQUIRED,
     ConfigValidationError,
     Issue,
+    ValidationResult,
     check_boiler,
     check_chp,
     check_heat_pump,
@@ -297,20 +298,20 @@ class PlantConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PlantConfig":
-        """Construct from a dict (e.g. parsed from JSON).
+    def from_dict_with_result(
+        cls, payload: dict[str, Any]
+    ) -> tuple["PlantConfig", ValidationResult]:
+        """Construct from a dict and also return the payload's ValidationResult.
 
-        Runs ``validate_plant_payload`` upfront so this path uses the same
-        rule set as the operator API. On failure raises
-        ``ConfigValidationError`` (a ``ValueError`` subclass) which carries
-        the full ``ValidationResult`` on ``.result`` — callers wanting every
-        error and warning catch this; legacy ``except ValueError`` still
-        works and sees the first error's message.
+        Same contract as ``from_dict`` on failure (raises
+        ``ConfigValidationError``). On success the returned ``ValidationResult``
+        carries any warnings, so callers (the daemon's live reload path) can
+        log warnings without re-running the validator.
         """
         result = validate_plant_payload(payload, expected_schema_version=CONFIG_SCHEMA_VERSION)
         if not result.ok:
             raise ConfigValidationError(result)
-        return cls(
+        cfg = cls(
             dt_h=float(payload["dt_h"]),
             gas_price_eur_mwh_hs=float(payload["gas_price_eur_mwh_hs"]),
             co2_factor_t_per_mwh_hs=float(payload["co2_factor_t_per_mwh_hs"]),
@@ -328,6 +329,21 @@ class PlantConfig:
                 StorageParams(**item) for item in payload.get("storages", [])
             ),
         )
+        return cfg, result
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PlantConfig":
+        """Construct from a dict (e.g. parsed from JSON).
+
+        Runs ``validate_plant_payload`` upfront so this path uses the same
+        rule set as the operator API. On failure raises
+        ``ConfigValidationError`` (a ``ValueError`` subclass) which carries
+        the full ``ValidationResult`` on ``.result`` — callers wanting every
+        error and warning catch this; legacy ``except ValueError`` still
+        works and sees the first error's message.
+        """
+        cfg, _ = cls.from_dict_with_result(payload)
+        return cfg
 
     def to_json(self, path: Path) -> None:
         """Atomic-write the config to JSON (tmp-then-replace), analogous to
@@ -342,6 +358,17 @@ class PlantConfig:
     def from_json(cls, path: Path) -> "PlantConfig":
         """Load config from JSON. FileNotFoundError if missing."""
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+    @classmethod
+    def from_json_with_result(
+        cls, path: Path
+    ) -> tuple["PlantConfig", ValidationResult]:
+        """Load config from JSON and also return the ValidationResult.
+
+        Same as ``from_json`` but exposes warnings to the caller without
+        forcing a second validator pass.
+        """
+        return cls.from_dict_with_result(json.loads(Path(path).read_text()))
 
 
 @dataclass(frozen=True)

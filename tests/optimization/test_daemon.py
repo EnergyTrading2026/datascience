@@ -516,7 +516,7 @@ def test_maybe_reload_rejects_validation_errors_with_full_diff(tmp_path, caplog)
 
     assert result is base
     msg = "\n".join(r.message for r in caplog.records)
-    assert "validation failed" in msg
+    assert "validation error" in msg
     assert "MIN_EXCEEDS_MAX" in msg
     assert "NEGATIVE" in msg
     # Watermark advanced — broken file does not get re-tried until next save.
@@ -636,6 +636,193 @@ def test_worker_passes_reloaded_config_to_next_cycle(tmp_path, monkeypatch):
 
     assert len(seen_configs) == 1
     assert seen_configs[0].gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
+
+
+def test_maybe_reload_no_op_when_content_identical(tmp_path, caplog):
+    """``touch`` (or any mtime bump with unchanged content) must not swap and
+    must not produce a 'config reloaded' log — otherwise idle saves spam logs
+    and confuse the operator about what changed."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    state = daemon._ConfigReloadState(last_mtime_ns=config_path.stat().st_mtime_ns)
+
+    # Bump mtime without changing content.
+    _bump_mtime(config_path)
+
+    with caplog.at_level("INFO", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(config_path, base, state)
+
+    assert result is base  # identity preserved on no-op
+    # Watermark still advances so the comparison is fast next time.
+    assert state.last_mtime_ns == config_path.stat().st_mtime_ns
+    # And critically: nothing logged.
+    assert all("config reload" not in r.message for r in caplog.records)
+
+
+def test_maybe_reload_rejects_when_state_infeasible_under_new_config(tmp_path, caplog):
+    """Parameter-only change that strands the stored SoC outside the new
+    [floor, capacity] must be rejected — same-asset-set alone is not enough
+    to guarantee the existing state is still feasible."""
+    config_path = tmp_path / "plant_config.json"
+    state_path = tmp_path / "current.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    # Save a state whose SoC sits comfortably above the original floor.
+    stored = base.storages[0]
+    state_dispatch = DispatchState.cold_start(base, pd.Timestamp.now(tz="UTC"))
+    state_dispatch.storages[stored.id].soc_mwh_th = stored.floor_mwh_th + 5.0
+    state_dispatch.save(state_path)
+
+    # New config: raise floor above the current SoC. Validation passes
+    # (0 <= floor <= capacity), but the state can't survive the swap.
+    raised_floor = state_dispatch.storages[stored.id].soc_mwh_th + 10.0
+    bumped = replace(
+        base,
+        storages=(replace(stored, floor_mwh_th=raised_floor),),
+    )
+    _write_config(config_path, bumped)
+    _bump_mtime(config_path)
+    reload_state = daemon._ConfigReloadState(
+        last_mtime_ns=config_path.stat().st_mtime_ns - 1
+    )
+
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state, state_path=state_path
+        )
+
+    assert result is base  # reverted
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "state is infeasible" in msg
+    assert "below new floor_mwh_th" in msg
+    # Watermark advanced — broken edit doesn't re-trigger every cycle.
+    assert reload_state.last_mtime_ns == config_path.stat().st_mtime_ns
+
+
+def test_maybe_reload_state_path_none_skips_feasibility_check(tmp_path):
+    """Callers that don't have a state path (tests, init-time) must not be
+    blocked. The check is skipped silently — the worker's real path always
+    passes one."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    bumped = replace(base, gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 1.0)
+    _write_config(config_path, bumped)
+    state = daemon._ConfigReloadState(
+        last_mtime_ns=config_path.stat().st_mtime_ns - 1
+    )
+
+    # No state_path → feasibility check skipped, swap proceeds.
+    result = daemon._maybe_reload_plant_config(
+        config_path, base, state, state_path=None
+    )
+
+    assert result is not base
+    assert result.gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
+
+
+def test_maybe_reload_missing_state_file_skips_feasibility_check(tmp_path):
+    """If current.json doesn't exist yet, the swap goes through. The worker's
+    own _run_one will error if it ever actually needs a state file."""
+    config_path = tmp_path / "plant_config.json"
+    state_path = tmp_path / "does_not_exist.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    bumped = replace(base, gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 1.0)
+    _write_config(config_path, bumped)
+    state = daemon._ConfigReloadState(
+        last_mtime_ns=config_path.stat().st_mtime_ns - 1
+    )
+
+    result = daemon._maybe_reload_plant_config(
+        config_path, base, state, state_path=state_path
+    )
+
+    assert result is not base
+
+
+def test_maybe_reload_unreadable_state_still_applies_swap(tmp_path, caplog):
+    """Corrupt state file: log a warning and apply the swap anyway. The state
+    problem is the daemon's bigger issue — don't double-fail the operator's
+    legitimate config edit on it."""
+    config_path = tmp_path / "plant_config.json"
+    state_path = tmp_path / "current.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    state_path.write_text("{ not json")
+
+    bumped = replace(base, gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 1.0)
+    _write_config(config_path, bumped)
+    reload_state = daemon._ConfigReloadState(
+        last_mtime_ns=config_path.stat().st_mtime_ns - 1
+    )
+
+    with caplog.at_level("WARNING", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state, state_path=state_path
+        )
+
+    assert result is not base
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "could not read state" in msg
+
+
+def test_load_plant_config_with_watermark_stats_before_read(tmp_path, monkeypatch):
+    """Startup race: a write between stat and from_json must not be silently
+    swallowed by a post-read watermark. We verify stat() returns a value
+    captured BEFORE PlantConfig.from_json is called by simulating the race
+    via a from_json shim that bumps mtime."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    pre_mtime = config_path.stat().st_mtime_ns
+
+    orig_from_json = PlantConfig.from_json
+
+    def racing_from_json(path):
+        # Simulate an operator write landing during the read.
+        _bump_mtime(path)
+        return orig_from_json(path)
+
+    monkeypatch.setattr(PlantConfig, "from_json", staticmethod(racing_from_json))
+
+    cfg, watermark = daemon._load_plant_config_with_watermark(config_path)
+
+    assert cfg == base
+    # Watermark is the pre-read value, not the post-read one. So when the
+    # worker stats next, it will see the bumped mtime and trigger a reload.
+    assert watermark == pre_mtime
+    assert config_path.stat().st_mtime_ns > pre_mtime
+
+
+def test_load_plant_config_with_watermark_tolerates_stat_failure(tmp_path, monkeypatch):
+    """If pre-read stat fails for any reason, watermark is None and the
+    next worker cycle reloads on first stat — better than aborting startup."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    real_stat = type(config_path).stat
+    call = {"count": 0}
+
+    def flaky_stat(self, *args, **kwargs):
+        call["count"] += 1
+        if call["count"] == 1:
+            raise OSError("transient")
+        return real_stat(self, *args, **kwargs)
+
+    # Patch on the concrete subclass returned by Path(...) so from_json's
+    # own stat (inside Path.read_text) still works.
+    monkeypatch.setattr(type(config_path), "stat", flaky_stat)
+
+    cfg, watermark = daemon._load_plant_config_with_watermark(config_path)
+
+    assert cfg == base
+    assert watermark is None
 
 
 def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):

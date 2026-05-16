@@ -160,6 +160,43 @@ class DispatchState:
         }
         return cls(timestamp=ts, units=units, storages=storages)
 
+    def feasible_against(self, config: "PlantConfig") -> list[str]:
+        """Return a list of infeasibility messages, empty if state is feasible.
+
+        Catches parameter changes that the asset-id-set gate (used by live
+        reload) can't see: most importantly, raising ``floor_mwh_th`` above the
+        currently-stored SoC, or shrinking ``capacity_mwh_th`` below it. Either
+        would make the next MILP solve start from an infeasible initial SoC.
+
+        Unit ``time_in_state_steps`` is intentionally not checked: the MILP
+        enforces min-up/min-down against the new bounds, and a longer-than-
+        necessary on/off run is legal under any (positive) min_up/min_down.
+
+        Assumes the asset id sets already match (caller's gate). Storages
+        present in state but missing from config are skipped here; ``covers``
+        reports them.
+        """
+        problems: list[str] = []
+        storages_by_id = {s.id: s for s in config.storages}
+        # SoC is a float carried through the solver; tolerate sub-Wh rounding
+        # against an integer-MWh edit. Anything beyond that is a real bound bust.
+        tol = 1e-9
+        for sid, sstate in self.storages.items():
+            s = storages_by_id.get(sid)
+            if s is None:
+                continue
+            if sstate.soc_mwh_th < s.floor_mwh_th - tol:
+                problems.append(
+                    f"storage {sid!r}: current SoC={sstate.soc_mwh_th} is below "
+                    f"new floor_mwh_th={s.floor_mwh_th}"
+                )
+            elif sstate.soc_mwh_th > s.capacity_mwh_th + tol:
+                problems.append(
+                    f"storage {sid!r}: current SoC={sstate.soc_mwh_th} exceeds "
+                    f"new capacity_mwh_th={s.capacity_mwh_th}"
+                )
+        return problems
+
     def covers(self, config: "PlantConfig") -> None:
         """Validate that this state has an entry for every asset in `config`.
 
