@@ -132,7 +132,22 @@ The filename matters — the replay container reads exactly
 is overridden. If you move or rename the CSV, point `CSV_PATH` at the
 new location.
 
-### 4. Start both stacks
+### 4. Set the seed timestamp for the replay setup
+
+> **⚠️ Do this before step 5 on first deploy.** Skipping it leaves the
+> daemon idle — replay forecasts pile up but nothing gets dispatched.
+> Details in "Replay vs. live-feed timestamps" below.
+
+```bash
+# /opt/dispatch/.env
+echo 'INIT_STATE_SOLVE_TIME=2025-12-01T00:00:00Z' >> .env
+```
+
+Pick any tz-aware ISO timestamp older than `csv_end − 3 months`. With
+the bundled CSV that's `2025-12-01T00:00:00Z`. **Unset at live-feed
+cutover.**
+
+### 5. Start both stacks
 
 ```bash
 # Forecasting first so a forecast is ready by the time the daemon polls.
@@ -147,7 +162,7 @@ forecast appears) but bringing forecasting up first means the daemon
 processes a cycle immediately on its first scan rather than logging
 empty scans for one tick interval.
 
-### 5. Verify
+### 6. Verify
 
 ```bash
 docker compose ps                                             # init-state Exited 0, optimization Up (healthy)
@@ -199,6 +214,7 @@ them requires editing the compose file directly.
 | `FORECAST_RESOLUTION` | `hour` | ✓ | matches forecasting output |
 | `SCAN_INTERVAL_S` | `2` | ✓ | how often the daemon polls `data/forecast/` |
 | `STALE_GRACE_HOURS` | `0` | ✓ | opt-in stale floor (hours). 0 = disabled, required for CSV replay (months-old solve_times). Set to a positive int (e.g. `2`) at live-feed cutover so a wedged upstream producer feeding hours-old forecasts is rejected. **⚠️ Do NOT set this > 0 while the CSV replay forecaster is running — every forecast will be silently dropped as stale and the daemon will sit idle forever. See "Foot-gun" below.** |
+| `INIT_STATE_SOLVE_TIME` | unset (= seed `now.floor('h')` UTC) | ✓ | tz-aware ISO timestamp embedded in `current.json` on first deploy. Becomes the daemon's monotonicity floor (minus `commit_hours`). **Required for the CSV replay setup** — see "Replay vs. live-feed timestamps" below. Unset for live-feed operation. |
 
 > **⚠️ Foot-gun: `STALE_GRACE_HOURS` and the CSV replay are mutually exclusive.**
 > The replay forecaster (`docker-compose.forecasting.yml`) writes
@@ -213,6 +229,45 @@ them requires editing the compose file directly.
 > Only flip `STALE_GRACE_HOURS` to a positive value **after** the
 > live-feed cutover, when the upstream producer is writing
 > near-wall-clock `solve_time`s.
+
+### Replay vs. live-feed timestamps (`INIT_STATE_SOLVE_TIME`)
+
+> **⚠️ Required for first-time replay deploys.** Without this env set, the
+> documented happy-path produces zero dispatch — both containers come up
+> `(healthy)`, parquets pile up in `data/forecast/`, but the daemon's
+> monotonicity check silently rejects every replay forecast.
+
+`init-state` seeds `data/state/current.json` with a `timestamp` field on
+first deploy. The daemon uses that timestamp (minus `commit_hours`) as
+the monotonicity floor: any forecast whose `solve_time` is not strictly
+greater is treated as already-processed and dropped.
+
+By default `init-state` seeds the current top-of-hour UTC. That's right
+for a live-feed producer (whose `solve_time`s march forward from now),
+but **wrong for the CSV replay**, which writes `solve_time`s starting at
+`csv_end − 3 months` — months in the past relative to wall-clock, so
+every forecast loses the monotonicity check and the daemon sits idle.
+
+For the replay setup, set the seed timestamp to anything older than the
+earliest replay slot (`csv_end − 3 months`). With the bundled CSV
+(`csv_end = 2026-03-01T22:00Z`), `2025-12-01T00:00:00Z` is safe:
+
+```bash
+# in /opt/dispatch/.env (or equivalent)
+INIT_STATE_SOLVE_TIME=2025-12-01T00:00:00Z
+```
+
+Set this **before** the first `docker compose up`. If you've already
+brought the stack up without it, run `scripts/reset_demo.sh --yes` after
+adding the env — `init-state` is a noop on existing state, so the bad
+seed has to be wiped first.
+
+**At live-feed cutover, unset this env.** The live producer writes
+`solve_time`s near wall-clock; once the env is gone, `init-state`
+defaults back to seeding with `now.floor('h')` which is what live
+operation expects. The seed value gets overwritten by the first
+successful cycle anyway, so the only window it matters in is the very
+first deploy.
 
 ### Demo mode — speeding up the replay
 

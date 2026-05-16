@@ -43,17 +43,30 @@ services:
     <<: *optimization-image
     container_name: optimization-init-state
     restart: "no"
-    # Shell-form command so we can conditionally pass --config-file only when
-    # CONFIG_FILE is set. Without the conditional, an empty CONFIG_FILE would
-    # be passed as --config-file "" and init-state would error out.
+    # Shell-form command so we can conditionally pass --config-file and
+    # --solve-time only when the corresponding env is set. Without the
+    # conditional, an empty value would be passed as --flag "" and
+    # init-state would error out.
+    #
+    # INIT_STATE_SOLVE_TIME is the seed timestamp embedded in current.json
+    # — it becomes the daemon's monotonicity floor (minus commit_hours).
+    # Default (unset) = init-state uses pd.Timestamp.now(tz='UTC').floor('h'),
+    # which is correct for a live-feed producer but rejects every replay
+    # forecast as already-processed. For the CSV replay setup, set
+    # INIT_STATE_SOLVE_TIME to a timestamp older than csv_end - 3 months
+    # (e.g. 2025-12-01T00:00:00Z) in your .env before first `up`. Unset
+    # at live-feed cutover. See docs/deploy.md §"Replay vs. live-feed
+    # timestamps".
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         python -m optimization.init_state \
           --state-out /shared/state/current.json \
-          $${CONFIG_FILE:+--config-file "$$CONFIG_FILE"}
+          $${CONFIG_FILE:+--config-file "$$CONFIG_FILE"} \
+          $${INIT_STATE_SOLVE_TIME:+--solve-time "$$INIT_STATE_SOLVE_TIME"}
     environment:
       CONFIG_FILE: ${CONFIG_FILE:-}
+      INIT_STATE_SOLVE_TIME: ${INIT_STATE_SOLVE_TIME:-}
     volumes:
       - ./data/state:/shared/state
       - ./data/config:/shared/config:ro
