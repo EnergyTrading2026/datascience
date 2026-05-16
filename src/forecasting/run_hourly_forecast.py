@@ -14,13 +14,16 @@ from forecasting.data_cleaning import load_and_clean_data
 from forecasting.fill_missing_data import fill_missing_linear
 from forecasting.export import export_forecast
 
+from forecasting.lstm_model import LSTMForecaster
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 MODEL_REGISTRY = {
     'daily_naive': DailyNaiveForecaster,
     'weekly_naive': WeeklyNaiveForecaster,
-    'combined_seasonal': CombinedSeasonalForecaster
+    'combined_seasonal': CombinedSeasonalForecaster,
+    'lstm': LSTMForecaster
 }
 
 def calculate_and_log_error(model, actuals_df: pd.DataFrame, solve_time: pd.Timestamp, horizon: int = 35) -> Dict[str, float]:
