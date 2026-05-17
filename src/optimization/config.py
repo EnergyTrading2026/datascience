@@ -10,7 +10,13 @@ is the regression-pin anchor.
 
 ``RuntimeConfig`` is solver/operational tuning — change per deployment.
 
-``__post_init__`` and ``from_dict`` raise ``ValueError`` on any problem.
+All sanity checks live in ``config_validation`` (the same module Tasks 3-5's
+operator API will call). Per-asset ``__post_init__`` delegates to the
+per-asset rule function and raises ``ValueError`` on the first error;
+``PlantConfig.__post_init__`` runs the full validator for cross-asset and
+global checks. ``from_dict`` first runs ``validate_plant_payload`` so callers
+get a collect-all ``ConfigValidationError`` (carries the full
+``ValidationResult``) before any dataclass is constructed.
 """
 from __future__ import annotations
 
@@ -20,9 +26,33 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from optimization.config_validation import (
+    DT_H_REQUIRED,
+    ConfigValidationError,
+    Issue,
+    check_boiler,
+    check_chp,
+    check_heat_pump,
+    check_storage,
+    validate_plant_config,
+    validate_plant_payload,
+)
+
 # Bump on every breaking change to the on-disk plant_config.json schema.
 # Distinct from the state schema_version — config and state evolve separately.
 CONFIG_SCHEMA_VERSION = 1
+
+
+def _raise_first_error(issues: list[Issue]) -> None:
+    """Raise ``ValueError`` with the first error's message if any are present.
+
+    Per-asset ``__post_init__`` uses this to keep the "fail loud on first
+    contradiction" behavior. Operator code that wants the full list of
+    errors and warnings goes through ``validate_plant_payload`` directly.
+    """
+    for issue in issues:
+        if issue.severity == "error":
+            raise ValueError(issue.message)
 
 
 @dataclass(frozen=True)
@@ -35,14 +65,13 @@ class HeatPumpParams:
     cop: float
 
     def __post_init__(self) -> None:
-        _check_id(self.id)
-        _check_pos(self.p_el_max_mw, "p_el_max_mw", self.id)
-        if self.p_el_min_mw < 0 or self.p_el_min_mw > self.p_el_max_mw:
-            raise ValueError(
-                f"heat pump {self.id!r}: p_el_min_mw={self.p_el_min_mw} must be in "
-                f"[0, p_el_max_mw={self.p_el_max_mw}]"
-            )
-        _check_pos(self.cop, "cop", self.id)
+        _raise_first_error(check_heat_pump(
+            id=self.id,
+            p_el_min_mw=self.p_el_min_mw,
+            p_el_max_mw=self.p_el_max_mw,
+            cop=self.cop,
+            path="",
+        ))
 
 
 @dataclass(frozen=True)
@@ -57,19 +86,15 @@ class BoilerParams:
     min_down_steps: int
 
     def __post_init__(self) -> None:
-        _check_id(self.id)
-        _check_pos(self.q_max_mw_th, "q_max_mw_th", self.id)
-        if self.q_min_mw_th < 0 or self.q_min_mw_th > self.q_max_mw_th:
-            raise ValueError(
-                f"boiler {self.id!r}: q_min_mw_th={self.q_min_mw_th} must be in "
-                f"[0, q_max_mw_th={self.q_max_mw_th}]"
-            )
-        if not 0 < self.eff <= 1.5:
-            raise ValueError(f"boiler {self.id!r}: eff={self.eff} out of (0, 1.5]")
-        if self.min_up_steps < 1 or self.min_down_steps < 1:
-            raise ValueError(
-                f"boiler {self.id!r}: min_up_steps/min_down_steps must be >= 1"
-            )
+        _raise_first_error(check_boiler(
+            id=self.id,
+            q_min_mw_th=self.q_min_mw_th,
+            q_max_mw_th=self.q_max_mw_th,
+            eff=self.eff,
+            min_up_steps=self.min_up_steps,
+            min_down_steps=self.min_down_steps,
+            path="",
+        ))
 
 
 @dataclass(frozen=True)
@@ -86,21 +111,17 @@ class CHPParams:
     startup_cost_eur: float
 
     def __post_init__(self) -> None:
-        _check_id(self.id)
-        _check_pos(self.p_el_max_mw, "p_el_max_mw", self.id)
-        if self.p_el_min_mw < 0 or self.p_el_min_mw > self.p_el_max_mw:
-            raise ValueError(
-                f"CHP {self.id!r}: p_el_min_mw={self.p_el_min_mw} must be in "
-                f"[0, p_el_max_mw={self.p_el_max_mw}]"
-            )
-        if not 0 < self.eff_el <= 1:
-            raise ValueError(f"CHP {self.id!r}: eff_el={self.eff_el} out of (0, 1]")
-        if not 0 < self.eff_th <= 1:
-            raise ValueError(f"CHP {self.id!r}: eff_th={self.eff_th} out of (0, 1]")
-        if self.min_up_steps < 1 or self.min_down_steps < 1:
-            raise ValueError(f"CHP {self.id!r}: min_up_steps/min_down_steps must be >= 1")
-        if self.startup_cost_eur < 0:
-            raise ValueError(f"CHP {self.id!r}: startup_cost_eur must be >= 0")
+        _raise_first_error(check_chp(
+            id=self.id,
+            p_el_min_mw=self.p_el_min_mw,
+            p_el_max_mw=self.p_el_max_mw,
+            eff_el=self.eff_el,
+            eff_th=self.eff_th,
+            min_up_steps=self.min_up_steps,
+            min_down_steps=self.min_down_steps,
+            startup_cost_eur=self.startup_cost_eur,
+            path="",
+        ))
 
     @property
     def heat_power_ratio(self) -> float:
@@ -110,7 +131,15 @@ class CHPParams:
 
 @dataclass(frozen=True)
 class StorageParams:
-    """Single thermal storage. Hard floor enforced every step."""
+    """Single thermal storage. Hard floor enforced every step.
+
+    The loss-vs-charge warning is dt_h-dependent, but a standalone
+    ``StorageParams`` has no plant context — so this path checks it against
+    ``DT_H_REQUIRED`` (the only legal grid; any other dt_h is rejected at the
+    plant level). When ``PlantConfig`` is validated, the warning is
+    re-evaluated against the actual ``cfg.dt_h`` so a mismatch can't slip
+    through.
+    """
 
     id: str
     capacity_mwh_th: float
@@ -121,22 +150,17 @@ class StorageParams:
     soc_init_mwh_th: float
 
     def __post_init__(self) -> None:
-        _check_id(self.id)
-        _check_pos(self.capacity_mwh_th, "capacity_mwh_th", self.id)
-        if not 0 <= self.floor_mwh_th <= self.capacity_mwh_th:
-            raise ValueError(
-                f"storage {self.id!r}: floor_mwh_th={self.floor_mwh_th} must be in "
-                f"[0, capacity_mwh_th={self.capacity_mwh_th}]"
-            )
-        if self.charge_max_mw_th < 0 or self.discharge_max_mw_th < 0:
-            raise ValueError(f"storage {self.id!r}: charge/discharge limits must be >= 0")
-        if self.loss_mwh_per_step < 0:
-            raise ValueError(f"storage {self.id!r}: loss_mwh_per_step must be >= 0")
-        if not self.floor_mwh_th <= self.soc_init_mwh_th <= self.capacity_mwh_th:
-            raise ValueError(
-                f"storage {self.id!r}: soc_init_mwh_th={self.soc_init_mwh_th} must be "
-                f"in [floor={self.floor_mwh_th}, capacity={self.capacity_mwh_th}]"
-            )
+        _raise_first_error(check_storage(
+            id=self.id,
+            capacity_mwh_th=self.capacity_mwh_th,
+            floor_mwh_th=self.floor_mwh_th,
+            charge_max_mw_th=self.charge_max_mw_th,
+            discharge_max_mw_th=self.discharge_max_mw_th,
+            loss_mwh_per_step=self.loss_mwh_per_step,
+            soc_init_mwh_th=self.soc_init_mwh_th,
+            dt_h=DT_H_REQUIRED,
+            path="",
+        ))
 
 
 @dataclass(frozen=True)
@@ -158,37 +182,21 @@ class PlantConfig:
     storages: tuple[StorageParams, ...]
 
     def __post_init__(self) -> None:
-        if self.dt_h <= 0:
-            raise ValueError(f"dt_h must be > 0, got {self.dt_h}")
-        if self.gas_price_eur_mwh_hs < 0:
-            raise ValueError("gas_price_eur_mwh_hs must be >= 0")
-        if self.co2_factor_t_per_mwh_hs < 0 or self.co2_price_eur_per_t < 0:
-            raise ValueError("co2 factor/price must be >= 0")
         # Frozen dataclass: coerce list inputs to tuples without mutating self.
+        # Must happen before validation since the validator iterates each tuple.
         for fname in ("heat_pumps", "boilers", "chps", "storages"):
             v = getattr(self, fname)
             if not isinstance(v, tuple):
                 object.__setattr__(self, fname, tuple(v))
-        # Global ID uniqueness
-        seen: dict[str, str] = {}
-        for family, items in (
-            ("heat_pumps", self.heat_pumps),
-            ("boilers", self.boilers),
-            ("chps", self.chps),
-            ("storages", self.storages),
-        ):
-            for it in items:
-                if it.id in seen:
-                    raise ValueError(
-                        f"duplicate asset id {it.id!r} (in {family} and {seen[it.id]})"
-                    )
-                seen[it.id] = family
-        # At least one heat producer (otherwise demand can never be met)
-        if not (self.heat_pumps or self.boilers or self.chps):
-            raise ValueError(
-                "PlantConfig has zero heat producers (HP+Boiler+CHP all empty); "
-                "demand cannot be met"
-            )
+        # Per-asset __post_init__ already validated each item; this re-runs
+        # the full validator to catch cross-asset errors (uniqueness,
+        # has-producer, globals like dt_h). Per-asset checks are cheap, so we
+        # accept the redundancy in exchange for one entrypoint with one rule
+        # set. Raises ConfigValidationError (a ValueError subclass) so direct
+        # construction surfaces the full ValidationResult, same as from_dict.
+        result = validate_plant_config(self)
+        if result.errors:
+            raise ConfigValidationError(result)
 
     @property
     def gas_cost_eur_mwh_hs(self) -> float:
@@ -270,58 +278,36 @@ class PlantConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PlantConfig":
-        """Construct from a dict (e.g. parsed from JSON). Validates schema_version
-        and per-asset shape; physical bounds are enforced by each dataclass'
-        ``__post_init__``.
+        """Construct from a dict (e.g. parsed from JSON).
+
+        Runs ``validate_plant_payload`` upfront so this path uses the same
+        rule set as the operator API. On failure raises
+        ``ConfigValidationError`` (a ``ValueError`` subclass) which carries
+        the full ``ValidationResult`` on ``.result`` — callers wanting every
+        error and warning catch this; legacy ``except ValueError`` still
+        works and sees the first error's message.
         """
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"plant config must be a JSON object, got {type(payload).__name__}"
-            )
-        version = payload.get("schema_version")
-        if version is None:
-            raise ValueError(
-                "plant config payload is missing schema_version. "
-                f"Expected {CONFIG_SCHEMA_VERSION}."
-            )
-        if version != CONFIG_SCHEMA_VERSION:
-            raise ValueError(
-                f"plant config schema_version={version}, expected "
-                f"{CONFIG_SCHEMA_VERSION}. No migration available."
-            )
-        # Reject unknown top-level keys so e.g. ``heat_pumpz`` doesn't silently
-        # load as zero heat pumps. Mirrors the per-asset _check_keys guard.
-        extra = set(payload) - _TOP_LEVEL_FIELDS
-        if extra:
-            raise ValueError(
-                f"plant config has unknown top-level keys: {sorted(extra)}. "
-                f"Expected: {sorted(_TOP_LEVEL_FIELDS)}"
-            )
-        try:
-            return cls(
-                dt_h=float(payload["dt_h"]),
-                gas_price_eur_mwh_hs=float(payload["gas_price_eur_mwh_hs"]),
-                co2_factor_t_per_mwh_hs=float(payload["co2_factor_t_per_mwh_hs"]),
-                co2_price_eur_per_t=float(payload["co2_price_eur_per_t"]),
-                heat_pumps=tuple(
-                    HeatPumpParams(**_check_keys(item, _HP_FIELDS, "heat_pump"))
-                    for item in payload.get("heat_pumps", [])
-                ),
-                boilers=tuple(
-                    BoilerParams(**_check_keys(item, _BOILER_FIELDS, "boiler"))
-                    for item in payload.get("boilers", [])
-                ),
-                chps=tuple(
-                    CHPParams(**_check_keys(item, _CHP_FIELDS, "chp"))
-                    for item in payload.get("chps", [])
-                ),
-                storages=tuple(
-                    StorageParams(**_check_keys(item, _STORAGE_FIELDS, "storage"))
-                    for item in payload.get("storages", [])
-                ),
-            )
-        except KeyError as e:
-            raise ValueError(f"plant config missing required field: {e.args[0]!r}") from e
+        result = validate_plant_payload(payload, expected_schema_version=CONFIG_SCHEMA_VERSION)
+        if not result.ok:
+            raise ConfigValidationError(result)
+        return cls(
+            dt_h=float(payload["dt_h"]),
+            gas_price_eur_mwh_hs=float(payload["gas_price_eur_mwh_hs"]),
+            co2_factor_t_per_mwh_hs=float(payload["co2_factor_t_per_mwh_hs"]),
+            co2_price_eur_per_t=float(payload["co2_price_eur_per_t"]),
+            heat_pumps=tuple(
+                HeatPumpParams(**item) for item in payload.get("heat_pumps", [])
+            ),
+            boilers=tuple(
+                BoilerParams(**item) for item in payload.get("boilers", [])
+            ),
+            chps=tuple(
+                CHPParams(**item) for item in payload.get("chps", [])
+            ),
+            storages=tuple(
+                StorageParams(**item) for item in payload.get("storages", [])
+            ),
+        )
 
     def to_json(self, path: Path) -> None:
         """Atomic-write the config to JSON (tmp-then-replace), analogous to
@@ -338,37 +324,6 @@ class PlantConfig:
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
-_TOP_LEVEL_FIELDS = {
-    "schema_version", "dt_h", "gas_price_eur_mwh_hs",
-    "co2_factor_t_per_mwh_hs", "co2_price_eur_per_t",
-    "heat_pumps", "boilers", "chps", "storages",
-}
-_HP_FIELDS = {"id", "p_el_min_mw", "p_el_max_mw", "cop"}
-_BOILER_FIELDS = {"id", "q_min_mw_th", "q_max_mw_th", "eff", "min_up_steps", "min_down_steps"}
-_CHP_FIELDS = {
-    "id", "p_el_min_mw", "p_el_max_mw", "eff_el", "eff_th",
-    "min_up_steps", "min_down_steps", "startup_cost_eur",
-}
-_STORAGE_FIELDS = {
-    "id", "capacity_mwh_th", "floor_mwh_th", "charge_max_mw_th",
-    "discharge_max_mw_th", "loss_mwh_per_step", "soc_init_mwh_th",
-}
-
-
-def _check_keys(item: dict, expected: set[str], family: str) -> dict:
-    """Raise on unknown or missing keys so typos in plant_config.json fail loud."""
-    if not isinstance(item, dict):
-        raise ValueError(f"{family} entry must be a dict, got {type(item).__name__}")
-    extra = set(item) - expected
-    missing = expected - set(item)
-    if extra or missing:
-        raise ValueError(
-            f"{family} entry id={item.get('id', '?')!r} has wrong fields. "
-            f"missing={sorted(missing)}, extra={sorted(extra)}"
-        )
-    return item
-
-
 @dataclass(frozen=True)
 class RuntimeConfig:
     """Operational tuning. Tweak per deployment without touching plant physics."""
@@ -383,21 +338,3 @@ class RuntimeConfig:
     # Set to 1.0 for honest forecast; the noise eval suggested ~1.10 reduces realized
     # cost slightly under MAPE=10%. Decide per real-data eval.
     demand_safety_factor: float = 1.0
-
-
-def _check_id(asset_id: str) -> None:
-    if not isinstance(asset_id, str):
-        raise ValueError(f"asset id must be a string, got {asset_id!r}")
-    # Reject empty, whitespace-only, and leading/trailing-whitespace IDs:
-    # an id like " hp " would silently fail to match "hp" in downstream
-    # parquet groupbys.
-    if not asset_id or asset_id.strip() != asset_id:
-        raise ValueError(
-            f"asset id must be a non-empty string with no leading/trailing "
-            f"whitespace, got {asset_id!r}"
-        )
-
-
-def _check_pos(value: float, name: str, asset_id: str) -> None:
-    if not value > 0:
-        raise ValueError(f"{name}={value} for asset {asset_id!r} must be > 0")
