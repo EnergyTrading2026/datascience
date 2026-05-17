@@ -90,7 +90,9 @@ services:
       DISPATCH_DIR: /shared/dispatch
       # Empty = PlantConfig.legacy_default(); set to a path inside the
       # container (e.g. /shared/config/plant_config.json) to deploy multi-asset.
-      # Daemon reads this once at startup; restart the container after editing.
+      # Parameter-only edits to this file are picked up at the next cycle
+      # boundary without a restart; adding/removing assets still requires
+      # stopping the daemon, re-seeding state, and restarting.
       CONFIG_FILE: ${CONFIG_FILE:-}
       PRICES_SOURCE: ${PRICES_SOURCE:-live}
       RESOLUTION: ${RESOLUTION:-quarterhour}

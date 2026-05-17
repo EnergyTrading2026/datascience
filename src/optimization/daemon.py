@@ -38,6 +38,27 @@ Two filters decide whether a forecast file is processed:
    set ``STALE_GRACE_HOURS=2`` (or similar) so a wedged upstream producer
    feeding hours-old forecasts is rejected instead of silently driving
    the optimizer off real-time prices.
+
+Live config reload: when CONFIG_FILE is set, the worker checks the file's
+mtime at every cycle boundary. If it changed, the file is re-validated and
+the in-memory PlantConfig is swapped before the next solve. The swap is
+gated on three checks — any failing one logs and keeps the previous config:
+  1. the new file validates (no errors from validate_plant_payload);
+  2. the asset id set is unchanged (add/remove is a separate task, requiring
+     state migration);
+  3. the currently-stored DispatchState is still feasible under the new
+     bounds (e.g. the new floor_mwh_th doesn't strand the SoC outside
+     [floor, capacity] — that would make the next solve infeasible).
+
+A no-op reload (mtime bumped via ``touch`` but content identical) advances
+the watermark silently — no swap, no log, no warning replay.
+
+RuntimeConfig is intentionally out of scope: it's loaded once at daemon
+start and not re-read. Operator changes to horizon hours / safety factor /
+solver gap still require a daemon restart.
+
+In-flight solves are unaffected because the worker is single-threaded — the
+swap happens between cycles, never inside ``run_one_cycle``.
 """
 from __future__ import annotations
 
@@ -56,6 +77,11 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from optimization.config import PlantConfig, RuntimeConfig
+from optimization.config_validation import (
+    ConfigValidationError,
+    Issue,
+    ValidationResult,
+)
 from optimization.run import run_one_cycle
 from optimization.state import DispatchState
 
@@ -103,8 +129,10 @@ class DaemonConfig:
     forecast_resolution: str
     scan_interval_s: int
     # Path to plant_config.json, or None to use PlantConfig.legacy_default().
-    # The actual PlantConfig is loaded once at daemon start (run()) and passed
-    # to every cycle; editing this file mid-run has no effect until restart.
+    # When set, the worker re-stats this file at every cycle boundary and
+    # swaps the in-memory PlantConfig if mtime changed and the new file
+    # validates with the same asset id set. legacy_default mode has no file
+    # and so no reload.
     config_file: Optional[Path] = None
 
     @classmethod
@@ -122,6 +150,241 @@ class DaemonConfig:
             scan_interval_s=int(os.environ.get("SCAN_INTERVAL_S", "2")),
             config_file=Path(config_file_str) if config_file_str else None,
         )
+
+
+@dataclass
+class _ConfigReloadState:
+    """Tracks the mtime watermark for the in-memory PlantConfig.
+
+    Seeded at daemon start from the initial load so the first cycle does not
+    spuriously "detect" a change. Advanced unconditionally on every observed
+    mtime bump — even when the candidate config is rejected — so a broken
+    file does not get re-tried (and re-logged) every cycle until the operator
+    saves it again.
+    """
+    last_mtime_ns: Optional[int] = None
+
+
+def _format_issues(issues: tuple[Issue, ...]) -> str:
+    """One ``severity code at path: message`` line per issue.
+
+    Callers gate on ``result.errors`` / ``result.warnings`` already, so the
+    empty case is not formatted here.
+    """
+    return "\n".join(
+        f"  {i.severity.upper()} {i.code} at {i.path}: {i.message}" for i in issues
+    )
+
+
+def _log_validation_result(
+    config_file: Path, result: ValidationResult, applied: bool
+) -> None:
+    """Log errors and warnings on separate log records.
+
+    Errors always go to ERROR. Warnings go to WARNING regardless of whether
+    the swap was applied — operators care about warnings either way. Each
+    record names its severity and count up-front so a log grep for ``ERROR``
+    or ``WARNING`` only surfaces the relevant lines.
+    """
+    if result.errors:
+        logger.error(
+            "config reload rejected for %s: %d validation error(s)\n%s",
+            config_file, len(result.errors), _format_issues(result.errors),
+        )
+    if result.warnings:
+        prefix = "applied with" if applied else "candidate also had"
+        logger.warning(
+            "config reload %s for %s: %d warning(s)\n%s",
+            prefix, config_file, len(result.warnings), _format_issues(result.warnings),
+        )
+
+
+def _log_startup_warnings(config_file: Path, result: ValidationResult) -> None:
+    """Surface validation warnings observed during the daemon's initial load.
+
+    Errors abort startup before this is reached; warnings would otherwise be
+    silently dropped, hiding policy violations the operator should see on
+    first boot. Phrased distinctly from the reload path so a log grep can
+    tell first-boot warnings from later live-edit warnings.
+    """
+    if not result.warnings:
+        return
+    logger.warning(
+        "config loaded from %s with %d warning(s):\n%s",
+        config_file, len(result.warnings), _format_issues(result.warnings),
+    )
+
+
+def _log_startup_validation_failure(
+    config_file: Path, result: ValidationResult
+) -> None:
+    """Log every issue from a startup-time ConfigValidationError.
+
+    ``ConfigValidationError.__str__`` only carries the first error message,
+    so a plain ``logger.error("%s", e)`` would hide every additional issue.
+    The operator wants the full picture in one boot attempt, not a peel-the-
+    onion loop. Warnings are surfaced too — they are still relevant context
+    even when errors abort the boot.
+    """
+    if result.errors:
+        logger.error(
+            "config load rejected for %s: %d validation error(s)\n%s",
+            config_file, len(result.errors), _format_issues(result.errors),
+        )
+    if result.warnings:
+        logger.warning(
+            "config load for %s also produced %d warning(s):\n%s",
+            config_file, len(result.warnings), _format_issues(result.warnings),
+        )
+
+
+def _load_plant_config_with_watermark(
+    config_file: Path,
+) -> tuple[PlantConfig, Optional[int], ValidationResult]:
+    """Load PlantConfig and capture the pre-read mtime watermark.
+
+    Stat happens BEFORE read so that a write landing between the two doesn't
+    advance the watermark past content the daemon never observed. If the
+    race fires, ``plant_config`` holds the new content but the watermark is
+    the older mtime; the next worker stat sees mtime has advanced and
+    triggers a (potentially no-op) reload that catches up.
+
+    The returned ValidationResult carries any warnings the payload produced
+    so the caller can surface them at startup — errors are raised as
+    ``ConfigValidationError`` before this returns.
+
+    Returns ``(cfg, mtime_ns | None, result)``. ``None`` watermark means
+    the next worker iteration reloads on its first stat — safe fallback.
+    """
+    try:
+        mtime_ns: Optional[int] = config_file.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = None
+    cfg, result = PlantConfig.from_json_with_result(config_file)
+    return cfg, mtime_ns, result
+
+
+def _maybe_reload_plant_config(
+    config_file: Optional[Path],
+    current: Optional[PlantConfig],
+    reload_state: _ConfigReloadState,
+    state_path: Optional[Path] = None,
+) -> Optional[PlantConfig]:
+    """Re-stat ``config_file`` and swap ``current`` if it changed and validates.
+
+    Returns the PlantConfig the next cycle should use — either the freshly
+    loaded one or ``current`` unchanged. The watermark in ``reload_state`` is
+    advanced on every observed mtime change, including rejections, so a
+    broken file does not re-trigger every cycle.
+
+    Reload is rejected (and ``current`` returned) when:
+      - the new file is unreadable (missing, bad JSON);
+      - validation fails (full ValidationResult is logged);
+      - the asset id set differs from ``current`` (deferred to the live
+        add/remove task);
+      - the current DispatchState at ``state_path`` is no longer feasible
+        under the new config (e.g. SoC outside the new [floor, capacity]).
+
+    If ``state_path`` is None or the state file doesn't exist, the
+    feasibility check is skipped (the worker's normal path already requires
+    ``current.json`` and will fail loudly later if it is missing).
+
+    A successful reload to an identical config (content unchanged, only
+    mtime bumped via ``touch``) is a silent no-op: watermark advances, no
+    log, no warning replay.
+    """
+    if config_file is None or current is None:
+        return current
+    try:
+        mtime_ns = config_file.stat().st_mtime_ns
+    except OSError as e:
+        logger.warning("config file %s not statable (%s); keeping current config", config_file, e)
+        return current
+    if reload_state.last_mtime_ns is not None and mtime_ns == reload_state.last_mtime_ns:
+        return current
+    reload_state.last_mtime_ns = mtime_ns
+    try:
+        candidate, result = PlantConfig.from_json_with_result(config_file)
+    except ConfigValidationError as e:
+        _log_validation_result(config_file, e.result, applied=False)
+        return current
+    except (ValueError, OSError) as e:
+        logger.error(
+            "config reload rejected for %s: could not load (%s); keeping current config",
+            config_file, e,
+        )
+        return current
+
+    # No-op: ``touch`` or whitespace-only edits bump mtime but leave content
+    # equivalent. PlantConfig is a frozen dataclass so structural equality
+    # covers every field that matters. Silent return keeps logs clean.
+    if candidate == current:
+        return current
+
+    # dt_h is the MILP grid resolution. UnitState.time_in_state_steps is
+    # counted in dt_h units, and min_up_steps / min_down_steps are dt_h-step
+    # counts too — changing dt_h would silently rescale every commitment
+    # constraint against carry-over state from the old grid. Reject it: a
+    # grid change is a daemon restart, not a hot reload.
+    if candidate.dt_h != current.dt_h:
+        logger.error(
+            "config reload rejected for %s: dt_h changed (%s → %s). "
+            "The MILP grid resolution is not hot-swappable because "
+            "DispatchState.time_in_state_steps is measured in dt_h units. "
+            "Restart the daemon to pick up a grid change.",
+            config_file, current.dt_h, candidate.dt_h,
+        )
+        if result.warnings:
+            _log_validation_result(config_file, result, applied=False)
+        return current
+
+    if not current.same_asset_set(candidate):
+        logger.error(
+            "config reload rejected for %s: asset id set changed — live add/remove "
+            "is a separate operation. Keeping current config.",
+            config_file,
+        )
+        # Still surface any warnings the candidate would have had, so the
+        # operator sees the full picture before retrying.
+        if result.warnings:
+            _log_validation_result(config_file, result, applied=False)
+        return current
+
+    # State feasibility: a parameter-only change can still strand the stored
+    # SoC outside the new [floor, capacity]. Catch it here rather than letting
+    # the next MILP solve fail with a less actionable infeasibility.
+    if state_path is not None and state_path.exists():
+        try:
+            state = DispatchState.load(state_path)
+        except (ValueError, KeyError, TypeError, OSError) as e:
+            # If state is unreadable the daemon has bigger problems; the
+            # next _run_one will surface it. Don't block the reload on it.
+            logger.warning(
+                "config reload: could not read state %s for feasibility check (%s); "
+                "applying swap without state check.",
+                state_path, e,
+            )
+        else:
+            problems = state.feasible_against(candidate)
+            if problems:
+                logger.error(
+                    "config reload rejected for %s: current state is infeasible "
+                    "under the new config:\n%s\n"
+                    "Adjust the offending bound or re-seed state before retrying.",
+                    config_file,
+                    "\n".join(f"  - {p}" for p in problems),
+                )
+                if result.warnings:
+                    _log_validation_result(config_file, result, applied=False)
+                return current
+
+    if result.warnings:
+        _log_validation_result(config_file, result, applied=True)
+    logger.info(
+        "config reloaded from %s (parameter-only change; asset set unchanged)",
+        config_file,
+    )
+    return candidate
 
 
 @dataclass
@@ -323,7 +586,10 @@ def _worker(
     work_queue: "queue.Queue[object]",
     stop_event: threading.Event,
     plant_config: Optional[PlantConfig] = None,
+    reload_state: Optional[_ConfigReloadState] = None,
 ) -> None:
+    if reload_state is None:
+        reload_state = _ConfigReloadState()
     while not stop_event.is_set():
         item = work_queue.get()
         try:
@@ -333,6 +599,15 @@ def _worker(
             last_solve_time = _read_last_solve_time(cfg.state_dir)
             if not _should_run(cfg, solve_time, last_solve_time):
                 continue
+            # Cycle boundary: re-stat the config file and swap if a valid
+            # parameter-only change is on disk. Skipped cycles above do not
+            # observe the new config — they wouldn't have used it anyway.
+            # Pass state_path so the reload can revert if the candidate's new
+            # SoC bounds would strand the currently-stored state.
+            plant_config = _maybe_reload_plant_config(
+                cfg.config_file, plant_config, reload_state,
+                state_path=cfg.state_dir / CURRENT_NAME,
+            )
             try:
                 _run_one(cfg, solve_time, plant_config=plant_config)
             except Exception:
@@ -408,12 +683,22 @@ def run(argv: list[str] | None = None) -> int:
             )
 
     plant_config: Optional[PlantConfig] = None
+    reload_state = _ConfigReloadState()
     if cfg.config_file is not None:
         try:
-            plant_config = PlantConfig.from_json(cfg.config_file)
-        except (FileNotFoundError, ValueError) as e:
+            plant_config, reload_state.last_mtime_ns, load_result = (
+                _load_plant_config_with_watermark(cfg.config_file)
+            )
+        except ConfigValidationError as e:
+            # ConfigValidationError is a ValueError subclass — catch it first
+            # so the full ValidationResult is logged, not just str(e) which
+            # only carries the first error message.
+            _log_startup_validation_failure(cfg.config_file, e.result)
+            return 1
+        except (OSError, ValueError) as e:
             logger.error("plant config load failed (%s): %s", cfg.config_file, e)
             return 1
+        _log_startup_warnings(cfg.config_file, load_result)
         logger.info(
             "loaded plant config from %s (%d HPs, %d boilers, %d CHPs, %d storages)",
             cfg.config_file, len(plant_config.heat_pumps), len(plant_config.boilers),
@@ -434,7 +719,7 @@ def run(argv: list[str] | None = None) -> int:
 
     worker_thread = threading.Thread(
         target=_worker,
-        args=(cfg, work_queue, stop_event, plant_config),
+        args=(cfg, work_queue, stop_event, plant_config, reload_state),
         name="mpc-worker",
         daemon=True,
     )

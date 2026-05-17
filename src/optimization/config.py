@@ -30,6 +30,7 @@ from optimization.config_validation import (
     DT_H_REQUIRED,
     ConfigValidationError,
     Issue,
+    ValidationResult,
     check_boiler,
     check_chp,
     check_heat_pump,
@@ -211,6 +212,26 @@ class PlantConfig:
             + [c.id for c in self.chps]
         )
 
+    def same_asset_set(self, other: "PlantConfig") -> bool:
+        """True iff ``other`` has exactly the same unit and storage IDs as self.
+
+        Family membership is part of the identity: moving an id from ``boilers``
+        to ``chps`` is treated as a different asset set even if the string id
+        is reused, because the per-family state schema differs.
+
+        Used by the daemon to gate live config reloads — parameter-only changes
+        keep ``DispatchState`` valid 1:1, whereas any add/remove requires the
+        state-migration path that lives in Task 4.
+        """
+        def fam(cfg: "PlantConfig") -> tuple[frozenset[str], ...]:
+            return (
+                frozenset(hp.id for hp in cfg.heat_pumps),
+                frozenset(b.id for b in cfg.boilers),
+                frozenset(c.id for c in cfg.chps),
+                frozenset(s.id for s in cfg.storages),
+            )
+        return fam(self) == fam(other)
+
     @classmethod
     def legacy_default(cls) -> "PlantConfig":
         """The hardcoded 1-of-each-asset plant from the original spec.
@@ -277,20 +298,20 @@ class PlantConfig:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PlantConfig":
-        """Construct from a dict (e.g. parsed from JSON).
+    def from_dict_with_result(
+        cls, payload: dict[str, Any]
+    ) -> tuple["PlantConfig", ValidationResult]:
+        """Construct from a dict and also return the payload's ValidationResult.
 
-        Runs ``validate_plant_payload`` upfront so this path uses the same
-        rule set as the operator API. On failure raises
-        ``ConfigValidationError`` (a ``ValueError`` subclass) which carries
-        the full ``ValidationResult`` on ``.result`` — callers wanting every
-        error and warning catch this; legacy ``except ValueError`` still
-        works and sees the first error's message.
+        Same contract as ``from_dict`` on failure (raises
+        ``ConfigValidationError``). On success the returned ``ValidationResult``
+        carries any warnings, so callers (the daemon's live reload path) can
+        log warnings without re-running the validator.
         """
         result = validate_plant_payload(payload, expected_schema_version=CONFIG_SCHEMA_VERSION)
         if not result.ok:
             raise ConfigValidationError(result)
-        return cls(
+        cfg = cls(
             dt_h=float(payload["dt_h"]),
             gas_price_eur_mwh_hs=float(payload["gas_price_eur_mwh_hs"]),
             co2_factor_t_per_mwh_hs=float(payload["co2_factor_t_per_mwh_hs"]),
@@ -308,6 +329,21 @@ class PlantConfig:
                 StorageParams(**item) for item in payload.get("storages", [])
             ),
         )
+        return cfg, result
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PlantConfig":
+        """Construct from a dict (e.g. parsed from JSON).
+
+        Runs ``validate_plant_payload`` upfront so this path uses the same
+        rule set as the operator API. On failure raises
+        ``ConfigValidationError`` (a ``ValueError`` subclass) which carries
+        the full ``ValidationResult`` on ``.result`` — callers wanting every
+        error and warning catch this; legacy ``except ValueError`` still
+        works and sees the first error's message.
+        """
+        cfg, _ = cls.from_dict_with_result(payload)
+        return cfg
 
     def to_json(self, path: Path) -> None:
         """Atomic-write the config to JSON (tmp-then-replace), analogous to
@@ -322,6 +358,17 @@ class PlantConfig:
     def from_json(cls, path: Path) -> "PlantConfig":
         """Load config from JSON. FileNotFoundError if missing."""
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+    @classmethod
+    def from_json_with_result(
+        cls, path: Path
+    ) -> tuple["PlantConfig", ValidationResult]:
+        """Load config from JSON and also return the ValidationResult.
+
+        Same as ``from_json`` but exposes warnings to the caller without
+        forcing a second validator pass.
+        """
+        return cls.from_dict_with_result(json.loads(Path(path).read_text()))
 
 
 @dataclass(frozen=True)

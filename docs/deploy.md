@@ -444,9 +444,18 @@ docker compose up -d --build
 ```
 
 Both `init-state` and the daemon read the same `CONFIG_FILE` env, so
-asset IDs stay in sync. The daemon loads the config once at startup;
-editing the file mid-run has no effect until restart (by design — a
-half-edited config can never reach the solver).
+asset IDs stay in sync.
+
+The daemon re-stats `CONFIG_FILE` at every cycle boundary. Parameter-only
+edits (prices, efficiencies, limits, min-up/down, storage bounds) are
+picked up on the next forecast cycle without a restart. The swap is
+atomic between cycles, never inside an in-flight solve. Each candidate is
+fully validated first; a half-edited or invalid config is rejected with
+an `ERROR` log line and the daemon keeps running on the previously loaded
+config. The swap is also rejected if `dt_h` changed, if the asset id set
+changed, or if the stored SoC would land outside the new
+`[floor_mwh_th, capacity_mwh_th]` bounds — for any of those the operator
+must stop, re-seed, and restart as in the four-step block above.
 
 `state.covers(config)` is called per cycle inside `build_model`; on
 config/state drift the cycle raises `ValueError` and the daemon's
