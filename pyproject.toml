@@ -3,29 +3,40 @@ name = "datascience"
 version = "0.1.0"
 description = "Forecasting and optimization for district heating dispatch"
 requires-python = ">=3.11"
+# Base deps are the intersection used by both forecasting and optimization.
+# Component-specific deps live under [project.optional-dependencies] so each
+# Docker image installs only what it needs.
 dependencies = [
     "numpy",
     "pandas",
     "pyarrow",
-    "matplotlib",
-    # pyomo + highspy versions are pinned because tests/optimization/
-    # test_regression_pin.py asserts bit-identical objective and dispatch
-    # against the pre-modular-assets MILP. Variable ordering and HiGHS
-    # branching heuristics can shift across releases (including patch
-    # releases for highspy, where branching tweaks have shipped before)
-    # and silently break the pin. highspy is pinned to an exact version;
-    # pyomo to the minor (its wrapper layer is more stable). If you bump
-    # either bound, re-run the regression pin first; if it drifts within
-    # ULP-noise, update the goldens (NOT the bounds) after a manual sanity
-    # check.
+]
+
+[project.optional-dependencies]
+# Installed in the optimization Docker image.
+#
+# pyomo + highspy versions are pinned because tests/optimization/
+# test_regression_pin.py asserts bit-identical objective and dispatch
+# against the pre-modular-assets MILP. Variable ordering and HiGHS
+# branching heuristics can shift across releases (including patch
+# releases for highspy, where branching tweaks have shipped before)
+# and silently break the pin. highspy is pinned to an exact version;
+# pyomo to the minor (its wrapper layer is more stable). If you bump
+# either bound, re-run the regression pin first; if it drifts within
+# ULP-noise, update the goldens (NOT the bounds) after a manual sanity
+# check.
+optimization = [
     "pyomo~=6.10.0",
     "highspy==1.14.0",
     "apscheduler",
 ]
-
-[project.optional-dependencies]
+# Installed in the forecasting Docker image. Scheduler drives the hourly
+# replay loop.
+forecasting = [
+    "apscheduler",
+]
 dev = ["pytest"]
-notebooks = ["jupyter", "ipykernel"]
+notebooks = ["jupyter", "ipykernel", "matplotlib"]
 
 [project.scripts]
 optimization-backtest = "optimization.backtest:main"

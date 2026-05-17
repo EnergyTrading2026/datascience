@@ -1,13 +1,8 @@
 # Compose file for the hourly MPC optimizer.
 #
-# First-time setup on a fresh Linux server:
-#     git clone <repo> /opt/optimization
-#     cd /opt/optimization
-#     docker compose up -d --build
-#
-# Updates:
-#     git pull
-#     docker compose up -d --build
+# Combined deployment (this stack + docker-compose.forecasting.yml) is
+# documented in docs/deploy.md — invoke both compose files from the same
+# working directory; the relative bind mounts (./data/...) depend on it.
 #
 # What runs:
 #     init-state    one-shot, seeds data/state/current.json on first deploy.
@@ -18,10 +13,14 @@
 #                   (rather than inotify) is intentional: identical behavior
 #                   on Linux and macOS, one mechanism, no platform quirks.
 #
+# Filename format is YYYY-MM-DDTHH-MM-SSZ.parquet — hyphens (not colons)
+# in the time portion so the names are valid on Windows filesystems and
+# match the daemon's scanner regex (see src/optimization/daemon.py).
+#
 # Data layout (bind-mounted under ./data):
-#     data/forecast/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (input)
+#     data/forecast/   <solve_time>.parquet            (input)
 #     data/state/      current.json + dated history    (persistent)
-#     data/dispatch/   <YYYY-MM-DDTHH:MM:SSZ>.parquet  (output)
+#     data/dispatch/   <solve_time>.parquet            (output)
 #     data/config/     plant_config.json (optional)    (input, read-only)
 #
 # Plant config (multi-asset):
@@ -44,17 +43,30 @@ services:
     <<: *optimization-image
     container_name: optimization-init-state
     restart: "no"
-    # Shell-form command so we can conditionally pass --config-file only when
-    # CONFIG_FILE is set. Without the conditional, an empty CONFIG_FILE would
-    # be passed as --config-file "" and init-state would error out.
+    # Shell-form command so we can conditionally pass --config-file and
+    # --solve-time only when the corresponding env is set. Without the
+    # conditional, an empty value would be passed as --flag "" and
+    # init-state would error out.
+    #
+    # INIT_STATE_SOLVE_TIME is the seed timestamp embedded in current.json
+    # — it becomes the daemon's monotonicity floor (minus commit_hours).
+    # Default (unset) = init-state uses pd.Timestamp.now(tz='UTC').floor('h'),
+    # which is correct for a live-feed producer but rejects every replay
+    # forecast as already-processed. For the CSV replay setup, set
+    # INIT_STATE_SOLVE_TIME to a timestamp older than csv_end - 3 months
+    # (e.g. 2025-12-01T00:00:00Z) in your .env before first `up`. Unset
+    # at live-feed cutover. See docs/deploy.md §"Replay vs. live-feed
+    # timestamps".
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         python -m optimization.init_state \
           --state-out /shared/state/current.json \
-          $${CONFIG_FILE:+--config-file "$$CONFIG_FILE"}
+          $${CONFIG_FILE:+--config-file "$$CONFIG_FILE"} \
+          $${INIT_STATE_SOLVE_TIME:+--solve-time "$$INIT_STATE_SOLVE_TIME"}
     environment:
       CONFIG_FILE: ${CONFIG_FILE:-}
+      INIT_STATE_SOLVE_TIME: ${INIT_STATE_SOLVE_TIME:-}
     volumes:
       - ./data/state:/shared/state
       - ./data/config:/shared/config:ro
@@ -86,11 +98,21 @@ services:
       RESOLUTION: ${RESOLUTION:-quarterhour}
       FORECAST_RESOLUTION: ${FORECAST_RESOLUTION:-hour}
       SCAN_INTERVAL_S: ${SCAN_INTERVAL_S:-2}
+      # Opt-in stale-floor (hours). 0 = disabled, required while the
+      # CSV replay producer is in use (it writes months-old solve_times).
+      # Set to a positive int at live-feed cutover.
+      STALE_GRACE_HOURS: ${STALE_GRACE_HOURS:-0}
     volumes:
       - ./data/forecast:/shared/forecast:ro
       - ./data/state:/shared/state
       - ./data/dispatch:/shared/dispatch
       - ./data/config:/shared/config:ro
+    # Cap memory so a runaway solve cannot drag the host down. pyomo +
+    # HiGHS on a 140-slot horizon comfortably fits in a few hundred MB;
+    # 2 GB is generous headroom for pathological MILPs without exposing
+    # the host.
+    mem_limit: 2g
+    mem_reservation: 512m
     healthcheck:
       # Heartbeat is seeded during init-state and then bumped by the daemon
       # after every successful cycle. 5400s = 90 min: well past the hourly

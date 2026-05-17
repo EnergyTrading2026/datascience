@@ -64,7 +64,7 @@ if __name__ == "__main__":
 
     # Resolve path relative to this script's location
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(script_dir, "../../data/forecasting/raw_data_measured_demand.csv")
+    file_path = os.path.join(script_dir, "../../data/demand_history/raw_data_measured_demand.csv")
     
     try:
         df_cleaned = load_and_clean_data(file_path)

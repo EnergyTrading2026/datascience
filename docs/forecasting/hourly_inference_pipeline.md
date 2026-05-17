@@ -41,3 +41,14 @@ python3 src/forecasting/run_hourly_forecast.py --solve_time "2026-03-01T12:00:00
 - `--solve_time`: The timestamp grounding the prediction. Defaults to the latest timestamp found in the data plus one hour.
 - `--horizon`: How many hours into the future to predict (default: 35).
 - `--log_metrics`: If set, evaluates the model's accuracy on the last `horizon` window and saves it to a `.json` file in the `output_dir`.
+
+## Containerized deployment
+
+The production path for the forecasting pipeline is a separate Docker
+stack (`docker-compose.forecasting.yml`) running the replay loop
+(`src/forecasting/replay_loop.py`). Operational details — first-time
+host setup, configuration env vars, restart behavior, healthcheck
+semantics, coordination with the optimization stack — live in the
+combined deployment runbook:
+
+→ [`docs/deploy.md`](../deploy.md)

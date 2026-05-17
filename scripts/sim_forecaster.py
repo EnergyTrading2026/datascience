@@ -48,7 +48,7 @@ def write_forecast(
     idx = pd.date_range(
         solve_time_berlin, periods=horizon_hours, freq="1h", tz="Europe/Berlin"
     )
-    fname = f"{solve_time_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}.parquet"
+    fname = f"{solve_time_utc.strftime('%Y-%m-%dT%H-%M-%SZ')}.parquet"
     out = forecast_dir / fname
     df = pd.DataFrame({DEMAND_COLUMN: [demand_mw_th] * horizon_hours}, index=idx)
     # Atomic write so the daemon never sees a partial parquet.

@@ -14,18 +14,34 @@ Requires **Python ≥ 3.11**.
 ```bash
 git clone git@github.com:EnergyTrading2026/datascience.git
 cd datascience
-pip install -e .
+pip install -e '.[optimization,forecasting]'
 ```
 
-This installs the optimization stack (`numpy`, `pandas`, `pyarrow`,
-`matplotlib`, `pyomo`, `highspy`, `apscheduler`). Notebooks
-need `pip install -e '.[notebooks]'` (adds `jupyter`, `ipykernel`).
+Base deps are the shared minimum (`numpy`, `pandas`, `pyarrow`).
+Component-specific deps live behind extras so each Docker image installs
+only what it needs:
+
+- `[optimization]` — `pyomo`, `highspy`, `apscheduler` (solver stack)
+- `[forecasting]` — `apscheduler` (drives the hourly replay loop)
+- `[notebooks]` — `jupyter`, `ipykernel`, `matplotlib`
+- `[dev]` — `pytest`
+
+For local development install both component extras as shown above (or
+`pip install -e '.[optimization,forecasting,notebooks,dev]'` for everything).
 Forecasting notebooks pull in additional packages (`scikit-learn`, `statsmodels`,
 `tensorflow`, `pmdarima`, `xgboost`) that you'll need to install separately.
 
 This editable install is the intended setup for local development and tests.
-The intended production path for the optimization service is Docker — see
-`docs/deploy/README.md`.
+The intended production path for both services is Docker — see
+[`docs/deploy.md`](docs/deploy.md) for the combined deployment runbook.
+
+> **Deploying for the first time?** Two compose files
+> (`docker-compose.yml` and `docker-compose.forecasting.yml`) must be
+> brought up from the same working directory. Before the first
+> `docker compose up`, copy `.env.example` to `.env` — the replay
+> setup will not produce any dispatch until `INIT_STATE_SOLVE_TIME`
+> is set there. Walk-through in
+> [`docs/deploy.md` §"First-time setup"](docs/deploy.md#first-time-setup).
 
 ## Project Structure
 
@@ -44,12 +60,15 @@ Optimization context lives in `docs/optimization/`: problem statement
 
 - `optimization-backtest` — runs the hourly MPC backtest harness
   (defined in `pyproject.toml`, see `src/optimization/backtest.py`).
-- Dockerized optimization service — see `docs/deploy/README.md` for the
-  production daemon, first-time setup, synthetic forecast smoke test, and
-  operational commands.
+- Dockerized dispatch pipeline (forecasting replay + optimization daemon)
+  — see [`docs/deploy.md`](docs/deploy.md) for first-time setup, services,
+  configuration, operations, and failure modes. Forecasting design notes
+  live in [`docs/forecasting/hourly_inference_pipeline.md`](docs/forecasting/hourly_inference_pipeline.md).
 - `scripts/sim_forecaster.py` — local smoke-test helper that writes a
   contract-shaped forecast parquet into `data/forecast/` so the Docker daemon
   can run a full optimization cycle without the real forecasting service.
+- `scripts/reset_demo.sh` — wipe both stacks plus shared state and bring
+  them back up; required when restarting the replay demo from the beginning.
 
 ## Workflow
 

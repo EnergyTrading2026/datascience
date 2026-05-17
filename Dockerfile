@@ -25,15 +25,16 @@ ENV UV_LINK_MODE=copy \
 WORKDIR /app
 
 # Install third-party deps first (cached layer; only invalidated when
-# pyproject.toml or uv.lock change).
+# pyproject.toml or uv.lock change). --extra optimization brings the solver
+# stack (pyomo, highspy) and apscheduler; forecasting-only deps stay out.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project --no-editable
+    uv sync --frozen --no-dev --extra optimization --no-install-project --no-editable
 
 # Install the project itself.
 COPY src/optimization ./src/optimization
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --extra optimization --no-editable
 
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
