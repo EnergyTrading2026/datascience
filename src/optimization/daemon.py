@@ -347,15 +347,35 @@ def _persist_migrated_state(
     iso = _now_iso_compact()
     new_name = f"migrate-{iso}.json"
     new_path = state_dir / new_name
+
+    # Order is load-bearing for crash safety:
+    #   1. Write the migrated state. If this raises, nothing is on disk yet —
+    #      no stray backup, no orphaned files for the operator to triage.
+    #   2. Write the pre-migration backup (destructive reloads only). If this
+    #      raises, delete the migrated file we just wrote so the failed
+    #      migration leaves nothing referenced or unreferenced behind.
+    #   3. Retarget the symlink. This is the atomic commit point; only after
+    #      it returns is the migration live.
+    migrated_state.save(new_path)
+
+    backup_path: Optional[Path] = None
     if diff.is_destructive:
         backup_path = state_dir / f"before-migrate-{iso}.json"
-        old_state.save(backup_path)
+        try:
+            old_state.save(backup_path)
+        except OSError:
+            try:
+                new_path.unlink()
+            except OSError:
+                pass
+            raise
+
+    _atomic_symlink(new_name, state_path)
+    if backup_path is not None:
         logger.warning(
             "destructive config reload: pre-migration state backed up to %s",
             backup_path,
         )
-    migrated_state.save(new_path)
-    _atomic_symlink(new_name, state_path)
     return new_path
 
 
@@ -405,23 +425,42 @@ def _maybe_reload_plant_config(
         return current
     if reload_state.last_mtime_ns is not None and mtime_ns == reload_state.last_mtime_ns:
         return current
+    # Watermark policy: advance immediately so an invalid-but-unchanged file
+    # doesn't get re-read and re-logged every cycle. Failures that the
+    # operator may want a transient retry for (read I/O, persist I/O) roll
+    # the watermark back to ``prev_mtime_ns`` below; validation rejections
+    # keep the advanced watermark so the operator's next save is what
+    # triggers the next attempt.
+    prev_mtime_ns = reload_state.last_mtime_ns
     reload_state.last_mtime_ns = mtime_ns
     try:
         candidate, result = PlantConfig.from_json_with_result(config_file)
     except ConfigValidationError as e:
         _log_validation_result(config_file, e.result, applied=False)
         return current
-    except (ValueError, OSError) as e:
+    except ValueError as e:
         logger.error(
             "config reload rejected for %s: could not load (%s); keeping current config",
             config_file, e,
         )
         return current
+    except OSError as e:
+        # Transient FS issue between stat and read (file vanished, EIO, ...).
+        # Roll back the watermark so the next cycle retries; the operator's
+        # last-saved content is still in flight from the daemon's view.
+        reload_state.last_mtime_ns = prev_mtime_ns
+        logger.error(
+            "config reload could not read %s (%s); will retry next cycle",
+            config_file, e,
+        )
+        return current
 
     # No-op: ``touch`` or whitespace-only edits bump mtime but leave content
-    # equivalent. PlantConfig is a frozen dataclass so structural equality
-    # covers every field that matters. Silent return keeps logs clean.
-    if candidate == current:
+    # equivalent. Comparing via ConfigDiff (not dataclass equality) means a
+    # reorder of ``disabled_asset_ids`` — same set, different tuple order —
+    # is also treated as a no-op and stays silent in the log.
+    diff = ConfigDiff.between(current, candidate)
+    if diff.is_noop:
         return current
 
     # dt_h is the MILP grid resolution. UnitState.time_in_state_steps is
@@ -440,8 +479,6 @@ def _maybe_reload_plant_config(
         if result.warnings:
             _log_validation_result(config_file, result, applied=False)
         return current
-
-    diff = ConfigDiff.between(current, candidate)
 
     # Family-move guard: a single id appearing in both removed and added sets
     # crossed a family boundary (HP→Boiler etc.). State schemas differ per
@@ -513,8 +550,15 @@ def _maybe_reload_plant_config(
                 state_dir, state_path, old_state, migrated_state, diff,
             )
         except OSError as e:
+            # Persist is the only failure path that can leave the daemon in
+            # an "operator-saved but not applied" state for a transient I/O
+            # reason (ENOSPC, FS hiccup). Roll the watermark back so the
+            # next cycle retries the swap; the in-memory config stays on
+            # the previous version until that retry succeeds.
+            reload_state.last_mtime_ns = prev_mtime_ns
             logger.error(
-                "config reload rejected for %s: failed to persist migrated state (%s)",
+                "config reload rejected for %s: failed to persist migrated "
+                "state (%s); will retry next cycle",
                 config_file, e,
             )
             if result.warnings:

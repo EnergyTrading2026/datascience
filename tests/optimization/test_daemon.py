@@ -1314,6 +1314,133 @@ def test_maybe_reload_mixed_add_remove_param_writes_backup_once(tmp_path, caplog
     assert "globals changed" in msg
 
 
+def test_maybe_reload_rolls_back_watermark_when_read_raises_oserror(tmp_path, monkeypatch, caplog):
+    """A transient OSError between stat and read (file vanished, EIO, ...)
+    must roll the watermark back so the next cycle retries instead of
+    silently dropping the operator's edit."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    initial_mtime = config_path.stat().st_mtime_ns
+    reload_state = daemon._ConfigReloadState(last_mtime_ns=initial_mtime)
+
+    _bump_mtime(config_path)
+    bumped_mtime = config_path.stat().st_mtime_ns
+    assert bumped_mtime != initial_mtime
+
+    def boom(path):
+        raise OSError("simulated transient read failure")
+
+    monkeypatch.setattr(PlantConfig, "from_json_with_result", classmethod(lambda cls, p: boom(p)))
+
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(config_path, base, reload_state)
+
+    assert result is base
+    assert reload_state.last_mtime_ns == initial_mtime  # rolled back
+    assert any("will retry next cycle" in r.message for r in caplog.records)
+
+
+def test_maybe_reload_rolls_back_watermark_when_persist_raises_oserror(tmp_path, monkeypatch, caplog):
+    """An OSError from the migration write path is also transient
+    (e.g. ENOSPC). Watermark rolls back so the next cycle retries; the
+    in-memory config stays on the old version."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    initial_mtime = config_path.stat().st_mtime_ns
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+
+    shrunk = replace(base, boilers=())
+    _write_config(config_path, shrunk)
+    _bump_mtime(config_path)
+    bumped_mtime = config_path.stat().st_mtime_ns
+
+    reload_state = daemon._ConfigReloadState(last_mtime_ns=initial_mtime)
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated persist failure")
+
+    monkeypatch.setattr(daemon, "_persist_migrated_state", boom)
+
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state,
+            state_path=state_dir / "current.json",
+            state_dir=state_dir,
+        )
+
+    assert result is base
+    assert reload_state.last_mtime_ns == initial_mtime  # rolled back
+    assert any("will retry next cycle" in r.message for r in caplog.records)
+
+
+def test_maybe_reload_disable_order_reorder_is_silent_noop(tmp_path, caplog):
+    """Reordering ``disabled_asset_ids`` (same set, different tuple order)
+    must not produce a log line or retarget anything. The is_noop check is
+    set-based; dataclass equality would miss this."""
+    config_path = tmp_path / "plant_config.json"
+    base = replace(PlantConfig.legacy_default(), disabled_asset_ids=("hp", "boiler"))
+    _write_config(config_path, base)
+    reload_state = daemon._ConfigReloadState(last_mtime_ns=config_path.stat().st_mtime_ns)
+
+    reordered = replace(base, disabled_asset_ids=("boiler", "hp"))
+    _write_config(config_path, reordered)
+    _bump_mtime(config_path)
+
+    with caplog.at_level("INFO", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(config_path, base, reload_state)
+
+    # The in-memory config stays on `base` (reorder is observationally a no-op,
+    # nothing for the daemon to swap to).
+    assert result is base
+    assert not any("config reloaded" in r.message for r in caplog.records)
+
+
+def test_persist_migrated_state_cleans_up_migrated_file_on_backup_failure(tmp_path, monkeypatch):
+    """If the migrated-state write succeeds but the backup write fails (e.g.
+    ENOSPC after the migrate file consumed the last inode), the migrated
+    file is deleted so the failed migration leaves nothing behind."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    old = _cs(seed_ts)
+    # Migrated state drops the boiler — destructive, so a backup is expected.
+    from optimization.config_diff import ConfigDiff
+    shrunk = replace(PlantConfig.legacy_default(), boilers=())
+    migrated = old.migrate_to(shrunk)
+    diff = ConfigDiff.between(PlantConfig.legacy_default(), shrunk)
+    assert diff.is_destructive
+
+    real_save = DispatchState.save
+    call_count = {"n": 0}
+
+    def patched_save(self, path):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First save is the migrated state — allow it.
+            return real_save(self, path)
+        raise OSError("simulated backup write failure")
+
+    monkeypatch.setattr(DispatchState, "save", patched_save)
+
+    try:
+        daemon._persist_migrated_state(
+            state_dir, state_dir / "current.json", old, migrated, diff,
+        )
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected OSError to propagate")
+
+    # No migrate-* file left behind (cleaned up on backup failure).
+    assert not any(p.name.startswith("migrate-") for p in state_dir.iterdir())
+    # No before-migrate-* file either (the failed write would have been there).
+    assert not any(p.name.startswith("before-migrate-") for p in state_dir.iterdir())
+
+
 def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):
     """When no CONFIG_FILE is set, plant_config defaults to None and
     run_one_cycle falls back to legacy_default() inside itself."""

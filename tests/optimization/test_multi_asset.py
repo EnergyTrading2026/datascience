@@ -772,6 +772,43 @@ def test_re_enable_after_disable_uses_state_as_if_paused(constant_inputs):
     assert differs, "re-enable should unlock storage decisions"
 
 
+def test_disabled_boiler_does_not_emit_shutdown_event_at_t1(constant_inputs):
+    """If a boiler was on going into a disable, the shutdown marker
+    ``d_boiler`` must NOT fire at t=1. The MILP would otherwise satisfy
+    ``d_boiler[1] >= z_prev - z[1] = 1`` for free (no objective term), and
+    a downstream dispatch consumer would read that as the optimizer's
+    choice to shut down, not the operator's forced disable."""
+    import pyomo.environ as pyo
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("boiler",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    state.units["boiler"] = UnitState(on=1, time_in_state_steps=TIS_LONG)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    for t in m.T_set:
+        assert pyo.value(m.d_boiler["boiler", t]) == pytest.approx(0.0)
+        assert pyo.value(m.s_boiler["boiler", t]) == pytest.approx(0.0)
+
+
+def test_disabled_chp_does_not_emit_startup_event_after_re_enable_window(constant_inputs):
+    """Same contract for CHP. ``s_chp`` already had a positive startup cost
+    that the solver minimizes, but ``d_chp`` had no objective coefficient
+    and would otherwise float freely; pin it to 0 for honest dispatch
+    reporting."""
+    import pyomo.environ as pyo
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("chp",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    state.units["chp"] = UnitState(on=1, time_in_state_steps=TIS_LONG)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    for t in m.T_set:
+        assert pyo.value(m.d_chp["chp", t]) == pytest.approx(0.0)
+        assert pyo.value(m.s_chp["chp", t]) == pytest.approx(0.0)
+
+
 def test_disable_does_not_break_min_down_on_other_assets(constant_inputs):
     """Disabling boiler must not collaterally affect CHP's min-down init fix."""
     demand, price = constant_inputs

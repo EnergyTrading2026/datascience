@@ -69,24 +69,33 @@ def _family_of(cfg: PlantConfig, asset_id: str) -> str:
     return "asset"
 
 
-def _format_added(cfg: PlantConfig, ids: frozenset[str], kind: str) -> list[str]:
-    """``+ added <family> 'id' (field=value, ...)`` for each added asset."""
+def _format_added(cfg: PlantConfig, ids: frozenset[str]) -> list[str]:
+    """``+ added <family> 'id':`` header followed by one field per line.
+
+    Same one-field-per-line layout as ``_format_param_changes`` so the
+    operator's eye scans the same way across add / remove / change blocks.
+    """
+    return _format_asset_lines(cfg, ids, prefix="+ added")
+
+
+def _format_removed(cfg: PlantConfig, ids: frozenset[str]) -> list[str]:
+    return _format_asset_lines(cfg, ids, prefix="- removed")
+
+
+def _format_asset_lines(
+    cfg: PlantConfig, ids: frozenset[str], *, prefix: str,
+) -> list[str]:
     lines: list[str] = []
     for aid in sorted(ids):
         family = _family_of(cfg, aid)
+        lines.append(f"  {prefix} {family} {aid!r}:")
         asset = _find_asset(cfg, aid)
-        details = _short_asdict(asset) if asset is not None else ""
-        lines.append(f"  + added {family} {aid!r}{details}")
-    return lines
-
-
-def _format_removed(cfg: PlantConfig, ids: frozenset[str], kind: str) -> list[str]:
-    lines: list[str] = []
-    for aid in sorted(ids):
-        family = _family_of(cfg, aid)
-        asset = _find_asset(cfg, aid)
-        details = _short_asdict(asset) if asset is not None else ""
-        lines.append(f"  - removed {family} {aid!r}{details}")
+        if asset is None:
+            continue
+        for k, v in sorted(asdict(asset).items()):
+            if k == "id":
+                continue
+            lines.append(f"      {k}: {v}")
     return lines
 
 
@@ -140,19 +149,12 @@ def _find_asset(cfg: PlantConfig, asset_id: str):
     return None
 
 
-def _short_asdict(asset) -> str:
-    """Inline-rendering of a dataclass asset for added/removed lines."""
-    d = asdict(asset)
-    parts = [f"{k}={v}" for k, v in d.items() if k != "id"]
-    return f" ({', '.join(parts)})" if parts else ""
-
-
 def _format_diff(current: PlantConfig, candidate: PlantConfig, diff: ConfigDiff) -> str:
     lines: list[str] = ["CONFIG DIFF (proposed vs. current)"]
-    lines.extend(_format_added(candidate, diff.added_unit_ids, "unit"))
-    lines.extend(_format_added(candidate, diff.added_storage_ids, "storage"))
-    lines.extend(_format_removed(current, diff.removed_unit_ids, "unit"))
-    lines.extend(_format_removed(current, diff.removed_storage_ids, "storage"))
+    lines.extend(_format_added(candidate, diff.added_unit_ids))
+    lines.extend(_format_added(candidate, diff.added_storage_ids))
+    lines.extend(_format_removed(current, diff.removed_unit_ids))
+    lines.extend(_format_removed(current, diff.removed_storage_ids))
     lines.extend(_format_param_changes(current, candidate, diff.param_changed_unit_ids))
     lines.extend(_format_param_changes(current, candidate, diff.param_changed_storage_ids))
     lines.extend(_format_globals_changes(current, candidate))

@@ -169,11 +169,18 @@ def build_model(
     # silently drift below floor over multi-cycle disables — turning the
     # asset off is a pause, not a slow drain.
     #
+    # Start (s_*) and shutdown (d_*) markers are pinned to 0 as well: if the
+    # prior state had the unit on (state.on==1) and disable forces z=0, the
+    # ``_b_shut`` / ``_c_shut`` rules would otherwise emit d=1 at t=1, which
+    # downstream dispatch consumers would read as the optimizer's choice to
+    # shut down. With s_/d_ pinned to 0 the start/shut rules are skipped at
+    # the constraint level (below) so no z_prev=1 + z=0 contradiction fires,
+    # and the extracted dispatch reports the asset as "untouched, off" — the
+    # honest representation of an operator-forced disable.
+    #
     # The per-asset min-up/down init-state-fixing blocks below explicitly
     # skip disabled units: forcing z=1 to honor a residual min-up while
-    # also forcing z=0 to disable is infeasible. The natural shutdown
-    # (z_prev=1, z[1]=0) emits d=1 at t=1 and then min_down is satisfied
-    # by z staying at 0 for the rest of the horizon.
+    # also forcing z=0 to disable is infeasible.
     disabled_ids: frozenset[str] = frozenset(config.disabled_asset_ids)
     for hp in config.heat_pumps:
         if hp.id in disabled_ids:
@@ -183,10 +190,14 @@ def build_model(
         if b.id in disabled_ids:
             for t in m.T_set:
                 m.z_boiler[b.id, t].fix(0)
+                m.s_boiler[b.id, t].fix(0)
+                m.d_boiler[b.id, t].fix(0)
     for c in config.chps:
         if c.id in disabled_ids:
             for t in m.T_set:
                 m.z_chp[c.id, t].fix(0)
+                m.s_chp[c.id, t].fix(0)
+                m.d_chp[c.id, t].fix(0)
     for s in config.storages:
         if s.id in disabled_ids:
             for t in m.T_set:
@@ -279,10 +290,14 @@ def build_model(
                 m.z_boiler[b.id, t].fix(0)
 
     def _b_start(m: pyo.ConcreteModel, i: str, t: int) -> pyo.Expression:
+        if i in disabled_ids:
+            return pyo.Constraint.Skip
         z_prev = state.units[i].on if t == 1 else m.z_boiler[i, t - 1]
         return m.s_boiler[i, t] >= m.z_boiler[i, t] - z_prev
 
     def _b_shut(m: pyo.ConcreteModel, i: str, t: int) -> pyo.Expression:
+        if i in disabled_ids:
+            return pyo.Constraint.Skip
         z_prev = state.units[i].on if t == 1 else m.z_boiler[i, t - 1]
         return m.d_boiler[i, t] >= z_prev - m.z_boiler[i, t]
 
@@ -334,10 +349,14 @@ def build_model(
                 m.z_chp[c.id, t].fix(0)
 
     def _c_start(m: pyo.ConcreteModel, i: str, t: int) -> pyo.Expression:
+        if i in disabled_ids:
+            return pyo.Constraint.Skip
         z_prev = state.units[i].on if t == 1 else m.z_chp[i, t - 1]
         return m.s_chp[i, t] >= m.z_chp[i, t] - z_prev
 
     def _c_shut(m: pyo.ConcreteModel, i: str, t: int) -> pyo.Expression:
+        if i in disabled_ids:
+            return pyo.Constraint.Skip
         z_prev = state.units[i].on if t == 1 else m.z_chp[i, t - 1]
         return m.d_chp[i, t] >= z_prev - m.z_chp[i, t]
 
