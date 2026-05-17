@@ -297,12 +297,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_format_validation(e.result))
         print("\nRESULT: cannot apply. PlantConfig construction failed.")
         return 1
+    except ValueError as e:
+        # Per-asset __post_init__ raises a plain ValueError (via
+        # _raise_first_error) for any rule that validate_plant_payload
+        # missed. With both paths sharing the check_* functions this is
+        # unreachable today; the catch exists so a future drift between
+        # the payload validator and per-asset checks surfaces here as a
+        # clean exit-1 instead of an unhandled traceback in the operator's
+        # deploy pipeline.
+        print(
+            f"error: PlantConfig construction failed despite passing payload "
+            f"validation: {e}",
+            file=sys.stderr,
+        )
+        print("\nRESULT: cannot apply. PlantConfig construction failed.")
+        return 1
 
     try:
         current = _resolve_current_config(args.current)
     except (OSError, ValueError) as e:
         print(f"error: could not read --current {args.current}: {e}", file=sys.stderr)
         return 1
+    if args.current is None:
+        # legacy_default() is a safe baseline only when the daemon is
+        # actually running on it (no CONFIG_FILE set). If the operator
+        # forgot --current and the daemon is on a real file, the printed
+        # diff will be spurious — every live asset will appear as
+        # "added" or "removed". Surface this loudly so the operator
+        # doesn't act on a misleading diff.
+        print(
+            "warning: --current not given; diffing against "
+            "PlantConfig.legacy_default(). If your daemon runs with a "
+            "CONFIG_FILE set, pass --current pointing at that file or "
+            "the diff below will be misleading.",
+            file=sys.stderr,
+        )
 
     diff = ConfigDiff.between(current, candidate)
     family_moves = sorted(diff.added_unit_ids & diff.removed_unit_ids)

@@ -261,7 +261,8 @@ def test_missing_state_file_does_not_block_apply(tmp_path, capsys):
 
 def test_default_current_is_legacy_default(tmp_path, capsys):
     """Without --current, the CLI compares the proposed against
-    PlantConfig.legacy_default(). Useful in legacy_default deployments."""
+    PlantConfig.legacy_default() and warns on stderr that the diff is
+    only meaningful in legacy_default deployments."""
     base = PlantConfig.legacy_default()
     grown = replace(
         base,
@@ -271,6 +272,11 @@ def test_default_current_is_legacy_default(tmp_path, capsys):
     )
     p = tmp_path / "p.json"
     _write_cfg(p, grown)
-    rc, stdout, _ = _run(["--proposed", str(p)], capsys)
+    rc, stdout, stderr = _run(["--proposed", str(p)], capsys)
     assert rc == 0
     assert "+ added heat_pump 'hp_x'" in stdout
+    # The fallback warning fires only when --current is omitted; tests that
+    # do pass --current must not see this string (asserted implicitly by
+    # the lack of a positive check in those tests).
+    assert "--current not given" in stderr
+    assert "legacy_default" in stderr

@@ -355,7 +355,10 @@ def _persist_migrated_state(
     #      raises, delete the migrated file we just wrote so the failed
     #      migration leaves nothing referenced or unreferenced behind.
     #   3. Retarget the symlink. This is the atomic commit point; only after
-    #      it returns is the migration live.
+    #      it returns is the migration live. If the retarget itself raises
+    #      (cross-FS replace, EIO), unlink both files we just wrote so a
+    #      repeating FS failure doesn't fill STATE_DIR with orphan
+    #      migrate-/before-migrate- pairs on every retry.
     migrated_state.save(new_path)
 
     backup_path: Optional[Path] = None
@@ -370,7 +373,17 @@ def _persist_migrated_state(
                 pass
             raise
 
-    _atomic_symlink(new_name, state_path)
+    try:
+        _atomic_symlink(new_name, state_path)
+    except OSError:
+        for p in (new_path, backup_path):
+            if p is None:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise
     if backup_path is not None:
         logger.warning(
             "destructive config reload: pre-migration state backed up to %s",

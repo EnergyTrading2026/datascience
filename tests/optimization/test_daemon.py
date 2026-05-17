@@ -1441,6 +1441,35 @@ def test_persist_migrated_state_cleans_up_migrated_file_on_backup_failure(tmp_pa
     assert not any(p.name.startswith("before-migrate-") for p in state_dir.iterdir())
 
 
+def test_persist_migrated_state_cleans_up_files_on_symlink_failure(tmp_path, monkeypatch):
+    """If both writes succeed but the symlink retarget fails (cross-FS replace,
+    EIO), both the migrate file and the backup are unlinked. Otherwise a
+    repeating FS failure would fill STATE_DIR with orphan pairs on every
+    retry cycle."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    old = _cs(seed_ts)
+    from optimization.config_diff import ConfigDiff
+    shrunk = replace(PlantConfig.legacy_default(), boilers=())
+    migrated = old.migrate_to(shrunk)
+    diff = ConfigDiff.between(PlantConfig.legacy_default(), shrunk)
+    assert diff.is_destructive
+
+    def boom_symlink(target_name, link_path):
+        raise OSError("simulated symlink retarget failure")
+
+    monkeypatch.setattr(daemon, "_atomic_symlink", boom_symlink)
+
+    with pytest.raises(OSError, match="simulated symlink"):
+        daemon._persist_migrated_state(
+            state_dir, state_dir / "current.json", old, migrated, diff,
+        )
+
+    assert not any(p.name.startswith("migrate-") for p in state_dir.iterdir())
+    assert not any(p.name.startswith("before-migrate-") for p in state_dir.iterdir())
+
+
 def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):
     """When no CONFIG_FILE is set, plant_config defaults to None and
     run_one_cycle falls back to legacy_default() inside itself."""
