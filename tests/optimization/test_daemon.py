@@ -739,6 +739,85 @@ def test_worker_passes_reloaded_config_to_next_cycle(tmp_path, monkeypatch):
     assert seen_configs[0].gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
 
 
+def test_worker_survives_unexpected_reload_exception(tmp_path, monkeypatch, caplog):
+    """An unexpected exception out of the reload path must not kill the worker
+    thread. The reload's explicit catches cover validation / OSError / ValueError;
+    anything outside that set (e.g. a future refactor raising RuntimeError) used
+    to silently take the thread down while the scheduler kept enqueuing. The
+    crash is logged, the prior plant_config is reused, and the next cycle runs."""
+    forecast_dir = tmp_path / "forecast"
+    state_dir = tmp_path / "state"
+    dispatch_dir = tmp_path / "dispatch"
+    config_path = tmp_path / "plant_config.json"
+    forecast_dir.mkdir()
+    state_dir.mkdir()
+    dispatch_dir.mkdir()
+
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+
+    t0 = pd.Timestamp.now(tz="UTC").floor("h")
+    t1 = t0 + pd.Timedelta(hours=1)
+    t2 = t0 + pd.Timedelta(hours=2)
+    DispatchState.cold_start(base, t0).save(state_dir / "current.json")
+
+    seen_configs: list[PlantConfig] = []
+
+    def fake_run_one_cycle(**kwargs):
+        seen_configs.append(kwargs["config"])
+        kwargs["dispatch_out"].write_text("staged")
+        DispatchState.cold_start(base, kwargs["solve_time"] + pd.Timedelta(hours=1)).save(
+            kwargs["state_out"]
+        )
+        return 0
+
+    monkeypatch.setattr(daemon, "run_one_cycle", fake_run_one_cycle)
+
+    call_count = {"n": 0}
+
+    def flaky_reload(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated unexpected reload failure")
+        # Second call returns the current config unchanged (no-op).
+        return args[1] if len(args) > 1 else kwargs.get("current")
+
+    monkeypatch.setattr(daemon, "_maybe_reload_plant_config", flaky_reload)
+
+    cfg = daemon.DaemonConfig(
+        forecast_dir=forecast_dir,
+        state_dir=state_dir,
+        dispatch_dir=dispatch_dir,
+        prices_source="live",
+        prices_path=None,
+        resolution="quarterhour",
+        forecast_resolution="hour",
+        scan_interval_s=2,
+        config_file=config_path,
+    )
+
+    work_queue: "queue.Queue[object]" = queue.Queue()
+    work_queue.put(t1)
+    work_queue.put(t2)
+    work_queue.put(daemon.SHUTDOWN_SENTINEL)
+
+    import threading as _t
+    stop_event = _t.Event()
+
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        daemon._worker(cfg, work_queue, stop_event, plant_config=base)
+
+    # The crashed cycle was logged with the solve_time it failed on.
+    assert any(
+        "cycle crashed" in r.message and t1.isoformat() in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+    # The second cycle ran with the last-good plant_config — the failed reload
+    # never overwrote it.
+    assert len(seen_configs) == 1
+    assert seen_configs[0] == base
+
+
 def test_maybe_reload_no_op_when_content_identical(tmp_path, caplog):
     """``touch`` (or any mtime bump with unchanged content) must not swap and
     must not produce a 'config reloaded' log — otherwise idle saves spam logs

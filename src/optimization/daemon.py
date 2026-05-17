@@ -804,12 +804,20 @@ def _worker(
             # observe the new config — they wouldn't have used it anyway.
             # Pass state_path so the reload can revert if the candidate's new
             # SoC bounds would strand the currently-stored state.
-            plant_config = _maybe_reload_plant_config(
-                cfg.config_file, plant_config, reload_state,
-                state_path=cfg.state_dir / CURRENT_NAME,
-                state_dir=cfg.state_dir,
-            )
+            #
+            # Wrap reload + run in the same broad guard: _maybe_reload catches
+            # its known errors (validation, OSError, ValueError) and returns
+            # the prior config. Anything outside that set would otherwise kill
+            # the worker thread silently while the scheduler keeps enqueuing.
+            # Keep the last-good plant_config on failure and let the next
+            # cycle retry; the reload's watermark policy already prevents
+            # spinning on the same broken file.
             try:
+                plant_config = _maybe_reload_plant_config(
+                    cfg.config_file, plant_config, reload_state,
+                    state_path=cfg.state_dir / CURRENT_NAME,
+                    state_dir=cfg.state_dir,
+                )
                 _run_one(cfg, solve_time, plant_config=plant_config)
             except Exception:
                 logger.exception("cycle crashed for solve_time=%s", solve_time.isoformat())
