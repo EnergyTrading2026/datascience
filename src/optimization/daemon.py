@@ -276,9 +276,16 @@ def _load_plant_config_with_watermark(
 
 
 def _now_iso_compact() -> str:
-    """Wall-clock UTC stamp in the ``YYYY-MM-DDTHH-MM-SSZ`` format used for
-    state filenames (':' replaced with '-' for Windows-mountable storage)."""
-    return pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H-%M-%SZ")
+    """Wall-clock UTC stamp for migrate/backup filenames.
+
+    Format ``YYYY-MM-DDTHH-MM-SS-ffffffZ`` (':' replaced with '-' for
+    Windows-mountable storage; ``%f`` is microseconds). Microsecond
+    precision avoids collisions when two reloads fire inside the same
+    second — possible in scripted operator pipelines and in tests using
+    frozen or rapidly-advancing clocks. Operator-facing strings are a few
+    chars longer but unambiguous.
+    """
+    return pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H-%M-%S-%fZ")
 
 
 def _format_diff_summary(diff: ConfigDiff) -> str:
@@ -327,6 +334,14 @@ def _persist_migrated_state(
     not yet swapped in memory, so the next start re-reads the old config
     and continues consistently.
     """
+    # Defensive: callers gate on ``diff.changes_asset_set``, which is true
+    # iff the candidate adds or removes an id. An add always inserts a fresh
+    # entry into the migrated state, so ``migrated == old`` cannot hold for
+    # an add. It *can* hold for a remove if the live state was already
+    # missing the asset being removed (state-config drift pre-existing the
+    # reload) — in that case migration is a no-op and there is nothing to
+    # write or back up. Returning early keeps the symlink pointed at the
+    # existing dated state.
     if migrated_state == old_state:
         return None
     iso = _now_iso_compact()
