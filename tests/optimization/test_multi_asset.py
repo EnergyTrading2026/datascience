@@ -655,3 +655,173 @@ def test_init_state_seed_invalid_config_file_errors(tmp_path):
     assert rc == 1
     assert not state_path.exists()
 
+
+# ---------------------- Disable: operator-forced off-switch ----------------------
+#
+# A disabled asset stays registered (state retained, id stable) but the MILP
+# constrains it to zero output. Tests cover every family and the storage's
+# frozen-SoC semantic; the validator-level coverage lives in
+# test_config_validation.py.
+
+
+def test_disabled_hp_yields_zero_p_el_in_dispatch(constant_inputs):
+    """HP marked disabled produces zero electrical setpoint across the commit
+    window — the binary z_hp is fixed to 0 and the bound constraints follow."""
+    demand, price = constant_inputs
+    base = PlantConfig.legacy_default()
+    # Two HPs so disabling one still leaves a producer mix capable of meeting
+    # demand without leaning entirely on boiler+CHP.
+    cfg = replace(
+        base,
+        heat_pumps=(
+            HeatPumpParams(id="hp_a", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.5),
+            HeatPumpParams(id="hp_b", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.5),
+        ),
+        disabled_asset_ids=("hp_a",),
+    )
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    assert d.hp_p_el_mw["hp_a"] == [pytest.approx(0.0)] * 4
+    # The enabled HP is free to be used; not asserted on, the solver may also
+    # leave it idle — the contract here is only "disabled means zero".
+
+
+def test_disabled_boiler_yields_zero_q_th_in_dispatch(constant_inputs):
+    """Disabled boiler emits zero thermal output and remains z=0 — even when
+    initial state has it on at TIS=0, which would normally lock z=1 for the
+    first ``min_up_steps`` steps. Disable wins."""
+    demand, price = constant_inputs
+    base = PlantConfig.legacy_default()
+    cfg = replace(base, disabled_asset_ids=("boiler",))
+    # Seed state with boiler on at TIS=0: in the absence of disable this would
+    # force the first min_up_steps steps to z=1. Disable must overrule.
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    state.units["boiler"] = UnitState(on=1, time_in_state_steps=0)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    assert d.boiler_q_th_mw["boiler"] == [pytest.approx(0.0)] * 4
+
+
+def test_disabled_chp_yields_zero_p_el_in_dispatch(constant_inputs):
+    """Disabled CHP: zero electrical output across the commit window."""
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("chp",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    assert d.chp_p_el_mw["chp"] == [pytest.approx(0.0)] * 4
+
+
+def test_disabled_storage_charge_discharge_zero_and_soc_frozen(constant_inputs):
+    """Disabled storage: charge and discharge are zero AND SoC stays at its
+    initial value across the full horizon (no loss drift while paused)."""
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("storage",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    initial_soc = state.storages["storage"].soc_mwh_th
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    assert d.sto_charge_mw_th["storage"] == [pytest.approx(0.0)] * 4
+    assert d.sto_discharge_mw_th["storage"] == [pytest.approx(0.0)] * 4
+    # SoC trajectory has length n_intervals + 1 (initial + each step end).
+    soc = d.soc_trajectory_mwh_th["storage"]
+    assert len(soc) == 5
+    assert all(v == pytest.approx(initial_soc) for v in soc), soc
+
+
+def test_re_enable_after_disable_uses_state_as_if_paused(constant_inputs):
+    """The whole point of disable being non-destructive: re-enabling an asset
+    after a period off resumes from the same SoC, with no special operator
+    action. Builds two models back-to-back: one with disable, one without,
+    same seed state. The enabled run must be free to dispatch the storage."""
+    demand, price = constant_inputs
+    base = PlantConfig.legacy_default()
+    cfg_off = replace(base, disabled_asset_ids=("storage",))
+    cfg_on = base
+    state = DispatchState.cold_start(cfg_off, demand.index[0])
+    initial_soc = state.storages["storage"].soc_mwh_th
+
+    # While disabled — solve and confirm SoC frozen.
+    m_off = build_model(demand, price, state, cfg_off)
+    solve(m_off, time_limit_s=30, mip_gap=0.005)
+    d_off = extract_dispatch(m_off, n_intervals=4, solve_time=demand.index[0])
+    assert all(v == pytest.approx(initial_soc) for v in d_off.soc_trajectory_mwh_th["storage"])
+
+    # Operator re-enables. Same state (SoC unchanged), no disable.
+    m_on = build_model(demand, price, state, cfg_on)
+    r = solve(m_on, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    # No assertion on the trajectory's exact shape (solver-dependent) — only
+    # that the SoC variable is no longer forcibly pinned to initial_soc.
+    d_on = extract_dispatch(m_on, n_intervals=4, solve_time=demand.index[0])
+    # At least one of charge / discharge / drift differs from the frozen run.
+    differs = (
+        d_on.sto_charge_mw_th["storage"] != d_off.sto_charge_mw_th["storage"]
+        or d_on.sto_discharge_mw_th["storage"] != d_off.sto_discharge_mw_th["storage"]
+        or d_on.soc_trajectory_mwh_th["storage"] != d_off.soc_trajectory_mwh_th["storage"]
+    )
+    assert differs, "re-enable should unlock storage decisions"
+
+
+def test_disabled_boiler_does_not_emit_shutdown_event_at_t1(constant_inputs):
+    """If a boiler was on going into a disable, the shutdown marker
+    ``d_boiler`` must NOT fire at t=1. The MILP would otherwise satisfy
+    ``d_boiler[1] >= z_prev - z[1] = 1`` for free (no objective term), and
+    a downstream dispatch consumer would read that as the optimizer's
+    choice to shut down, not the operator's forced disable."""
+    import pyomo.environ as pyo
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("boiler",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    state.units["boiler"] = UnitState(on=1, time_in_state_steps=TIS_LONG)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    for t in m.T_set:
+        assert pyo.value(m.d_boiler["boiler", t]) == pytest.approx(0.0)
+        assert pyo.value(m.s_boiler["boiler", t]) == pytest.approx(0.0)
+
+
+def test_disabled_chp_does_not_emit_startup_event_after_re_enable_window(constant_inputs):
+    """Same contract for CHP. ``s_chp`` already had a positive startup cost
+    that the solver minimizes, but ``d_chp`` had no objective coefficient
+    and would otherwise float freely; pin it to 0 for honest dispatch
+    reporting."""
+    import pyomo.environ as pyo
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("chp",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    state.units["chp"] = UnitState(on=1, time_in_state_steps=TIS_LONG)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    for t in m.T_set:
+        assert pyo.value(m.d_chp["chp", t]) == pytest.approx(0.0)
+        assert pyo.value(m.s_chp["chp", t]) == pytest.approx(0.0)
+
+
+def test_disable_does_not_break_min_down_on_other_assets(constant_inputs):
+    """Disabling boiler must not collaterally affect CHP's min-down init fix."""
+    demand, price = constant_inputs
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("boiler",))
+    state = DispatchState.cold_start(cfg, demand.index[0])
+    # CHP just shut down with TIS=1; min_down_steps=8 should still force z=0
+    # for the next 7 steps on the CHP — independent of the boiler being off.
+    state.units["chp"] = UnitState(on=0, time_in_state_steps=1)
+    m = build_model(demand, price, state, cfg)
+    r = solve(m, time_limit_s=30, mip_gap=0.005)
+    assert r.feasible
+    d = extract_dispatch(m, n_intervals=4, solve_time=demand.index[0])
+    # First 4 steps (one commit hour) of CHP should be off — well within the
+    # 7-step min-down remainder.
+    assert d.chp_p_el_mw["chp"] == [pytest.approx(0.0)] * 4
+

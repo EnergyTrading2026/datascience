@@ -70,6 +70,10 @@ class Codes:
     DT_H_NOT_QUARTERHOUR = "DT_H_NOT_QUARTERHOUR"
     DUPLICATE_ASSET_ID = "DUPLICATE_ASSET_ID"
     ZERO_HEAT_PRODUCERS = "ZERO_HEAT_PRODUCERS"
+    UNKNOWN_DISABLED_ID = "UNKNOWN_DISABLED_ID"
+    DUPLICATE_DISABLED_ID = "DUPLICATE_DISABLED_ID"
+    BAD_DISABLED_ID = "BAD_DISABLED_ID"
+    ALL_HEAT_PRODUCERS_DISABLED = "ALL_HEAT_PRODUCERS_DISABLED"
     PAYLOAD_NOT_DICT = "PAYLOAD_NOT_DICT"
     SCHEMA_VERSION_MISSING = "SCHEMA_VERSION_MISSING"
     SCHEMA_VERSION_MISMATCH = "SCHEMA_VERSION_MISMATCH"
@@ -501,6 +505,76 @@ def check_has_heat_producer(
     return []
 
 
+def check_disabled_asset_ids(
+    disabled_ids: tuple[str, ...] | list[str],
+    heat_pump_ids: list[str],
+    boiler_ids: list[str],
+    chp_ids: list[str],
+    storage_ids: list[str],
+) -> list[Issue]:
+    """``disabled_asset_ids`` is an operator-forced off-switch.
+
+    Each entry must (a) be a non-empty string, (b) match the id of an asset
+    that exists in one of the four families, and (c) appear at most once.
+    The list does not change the asset registry; it only constrains the
+    optimizer to zero output for the named asset. State is retained, so
+    toggling on/off is cheap and reversible.
+
+    A further plant-level error fires (separately) if every heat producer
+    (HP+Boiler+CHP) is in this list — the plant cannot meet demand in that
+    case, and the operator almost certainly didn't mean it.
+    """
+    issues: list[Issue] = []
+    known = set(heat_pump_ids) | set(boiler_ids) | set(chp_ids) | set(storage_ids)
+    seen: set[str] = set()
+    for idx, did in enumerate(disabled_ids):
+        path = f"disabled_asset_ids[{idx}]"
+        if not isinstance(did, str) or not did or did.strip() != did:
+            issues.append(_err(
+                Codes.BAD_DISABLED_ID, path,
+                f"disabled_asset_ids[{idx}]={did!r} must be a non-empty "
+                f"string with no leading/trailing whitespace",
+            ))
+            continue
+        if did in seen:
+            issues.append(_err(
+                Codes.DUPLICATE_DISABLED_ID, path,
+                f"disabled_asset_ids[{idx}]={did!r} appears more than once",
+            ))
+            continue
+        seen.add(did)
+        if did not in known:
+            issues.append(_err(
+                Codes.UNKNOWN_DISABLED_ID, path,
+                f"disabled_asset_ids[{idx}]={did!r} does not match any asset "
+                f"id; known ids: {sorted(known)}",
+            ))
+    return issues
+
+
+def check_not_all_heat_producers_disabled(
+    heat_pump_ids: list[str],
+    boiler_ids: list[str],
+    chp_ids: list[str],
+    disabled_ids: tuple[str, ...] | list[str],
+) -> list[Issue]:
+    """Every registered HP/Boiler/CHP in ``disabled_asset_ids`` means demand
+    cannot be met. Fires only when at least one heat producer is registered
+    (the ``ZERO_HEAT_PRODUCERS`` error covers the empty case)."""
+    producers = set(heat_pump_ids) | set(boiler_ids) | set(chp_ids)
+    if not producers:
+        return []
+    disabled = {d for d in disabled_ids if isinstance(d, str)}
+    if producers <= disabled:
+        return [_err(
+            Codes.ALL_HEAT_PRODUCERS_DISABLED, "disabled_asset_ids",
+            "every registered heat producer (HP+Boiler+CHP) is in "
+            "disabled_asset_ids; demand cannot be met. Re-enable at least "
+            "one or remove the producer from the config.",
+        )]
+    return []
+
+
 def warn_no_storages(n_storages: int) -> list[Issue]:
     if n_storages == 0:
         return [_warn(
@@ -566,14 +640,19 @@ def validate_plant_config(cfg: "PlantConfig") -> ValidationResult:
             path=f"storages[{i}]",
         ))
 
-    issues.extend(check_id_uniqueness(
-        [hp.id for hp in cfg.heat_pumps],
-        [b.id for b in cfg.boilers],
-        [c.id for c in cfg.chps],
-        [s.id for s in cfg.storages],
-    ))
+    hp_ids = [hp.id for hp in cfg.heat_pumps]
+    boiler_ids = [b.id for b in cfg.boilers]
+    chp_ids = [c.id for c in cfg.chps]
+    storage_ids = [s.id for s in cfg.storages]
+    issues.extend(check_id_uniqueness(hp_ids, boiler_ids, chp_ids, storage_ids))
     issues.extend(check_has_heat_producer(
         len(cfg.heat_pumps), len(cfg.boilers), len(cfg.chps),
+    ))
+    issues.extend(check_disabled_asset_ids(
+        cfg.disabled_asset_ids, hp_ids, boiler_ids, chp_ids, storage_ids,
+    ))
+    issues.extend(check_not_all_heat_producers_disabled(
+        hp_ids, boiler_ids, chp_ids, cfg.disabled_asset_ids,
     ))
     issues.extend(warn_no_storages(len(cfg.storages)))
 
@@ -586,6 +665,7 @@ _TOP_LEVEL_FIELDS: frozenset[str] = frozenset({
     "schema_version", "dt_h", "gas_price_eur_mwh_hs",
     "co2_factor_t_per_mwh_hs", "co2_price_eur_per_t",
     "heat_pumps", "boilers", "chps", "storages",
+    "disabled_asset_ids",
 })
 _HP_FIELDS: frozenset[str] = frozenset({"id", "p_el_min_mw", "p_el_max_mw", "cop"})
 _BOILER_FIELDS: frozenset[str] = frozenset({
@@ -862,6 +942,19 @@ def validate_plant_payload(
             if isinstance(aid, str):
                 ids_by_family[fam.key].append(aid)
 
+    # disabled_asset_ids is optional (default empty). Shape-check first; if
+    # it's not a list we skip the per-item rules entirely and record one
+    # ASSET_FIELDS_WRONG so the operator gets a single clear message rather
+    # than a cascade of stringified-int complaints.
+    raw_disabled = payload.get("disabled_asset_ids", [])
+    if not isinstance(raw_disabled, list):
+        issues.append(_err(
+            Codes.ASSET_FIELDS_WRONG, "disabled_asset_ids",
+            f"disabled_asset_ids must be a list of strings, got "
+            f"{type(raw_disabled).__name__}",
+        ))
+        raw_disabled = []
+
     # Cross-asset checks.
     issues.extend(check_id_uniqueness(
         ids_by_family["heat_pumps"], ids_by_family["boilers"],
@@ -871,6 +964,15 @@ def validate_plant_payload(
         count_by_family["heat_pumps"],
         count_by_family["boilers"],
         count_by_family["chps"],
+    ))
+    issues.extend(check_disabled_asset_ids(
+        raw_disabled,
+        ids_by_family["heat_pumps"], ids_by_family["boilers"],
+        ids_by_family["chps"], ids_by_family["storages"],
+    ))
+    issues.extend(check_not_all_heat_producers_disabled(
+        ids_by_family["heat_pumps"], ids_by_family["boilers"],
+        ids_by_family["chps"], raw_disabled,
     ))
     issues.extend(warn_no_storages(count_by_family["storages"]))
 

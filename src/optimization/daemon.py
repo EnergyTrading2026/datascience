@@ -42,13 +42,23 @@ Two filters decide whether a forecast file is processed:
 Live config reload: when CONFIG_FILE is set, the worker checks the file's
 mtime at every cycle boundary. If it changed, the file is re-validated and
 the in-memory PlantConfig is swapped before the next solve. The swap is
-gated on three checks — any failing one logs and keeps the previous config:
+gated on four checks — any failing one logs and keeps the previous config:
   1. the new file validates (no errors from validate_plant_payload);
-  2. the asset id set is unchanged (add/remove is a separate task, requiring
-     state migration);
-  3. the currently-stored DispatchState is still feasible under the new
-     bounds (e.g. the new floor_mwh_th doesn't strand the SoC outside
-     [floor, capacity] — that would make the next solve infeasible).
+  2. ``dt_h`` is unchanged (the MILP grid is not hot-swappable);
+  3. no asset id has moved between families (HP↔Boiler↔CHP↔Storage); same
+     id in a different family is rejected as a remove+add that the
+     operator should perform as two separate edits;
+  4. the migrated DispatchState (per ``ConfigDiff``-driven add/remove of
+     state entries) is still feasible under the new bounds.
+
+If the candidate adds or removes assets, the worker performs the state
+migration atomically at the cycle boundary: kept ids pass through
+byte-for-byte, removed ids' state is discarded, added ids get cold-start
+entries. The migrated state is written to a new file in ``STATE_DIR`` and
+``current.json`` is retargeted to it; the previous dated state file is
+left in place. On any destructive (remove) reload, a clearly-named copy
+of the pre-migration state is also written next to it so the operator can
+recover the prior state by hand if needed.
 
 A no-op reload (mtime bumped via ``touch`` but content identical) advances
 the watermark silently — no swap, no log, no warning replay.
@@ -77,6 +87,7 @@ import pandas as pd
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from optimization.config import PlantConfig, RuntimeConfig
+from optimization.config_diff import ConfigDiff
 from optimization.config_validation import (
     ConfigValidationError,
     Issue,
@@ -264,11 +275,129 @@ def _load_plant_config_with_watermark(
     return cfg, mtime_ns, result
 
 
+def _now_iso_compact() -> str:
+    """Wall-clock UTC stamp for migrate/backup filenames.
+
+    Format ``YYYY-MM-DDTHH-MM-SS-ffffffZ`` (':' replaced with '-' for
+    Windows-mountable storage; ``%f`` is microseconds). Microsecond
+    precision avoids collisions when two reloads fire inside the same
+    second — possible in scripted operator pipelines and in tests using
+    frozen or rapidly-advancing clocks. Operator-facing strings are a few
+    chars longer but unambiguous.
+    """
+    return pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+
+
+def _format_diff_summary(diff: ConfigDiff) -> str:
+    """One-line-per-change render of a ConfigDiff for the reload log."""
+    parts: list[str] = []
+    if diff.globals_changed:
+        parts.append("globals changed")
+    if diff.added_unit_ids:
+        parts.append(f"added units {sorted(diff.added_unit_ids)}")
+    if diff.added_storage_ids:
+        parts.append(f"added storages {sorted(diff.added_storage_ids)}")
+    if diff.removed_unit_ids:
+        parts.append(f"removed units {sorted(diff.removed_unit_ids)}")
+    if diff.removed_storage_ids:
+        parts.append(f"removed storages {sorted(diff.removed_storage_ids)}")
+    if diff.param_changed_unit_ids:
+        parts.append(f"param-changed units {sorted(diff.param_changed_unit_ids)}")
+    if diff.param_changed_storage_ids:
+        parts.append(f"param-changed storages {sorted(diff.param_changed_storage_ids)}")
+    if diff.disabled_added:
+        parts.append(f"disabled {sorted(diff.disabled_added)}")
+    if diff.disabled_removed:
+        parts.append(f"re-enabled {sorted(diff.disabled_removed)}")
+    return "; ".join(parts) if parts else "no observable change"
+
+
+def _persist_migrated_state(
+    state_dir: Path,
+    state_path: Path,
+    old_state: DispatchState,
+    migrated_state: DispatchState,
+    diff: ConfigDiff,
+) -> Optional[Path]:
+    """Write ``migrated_state`` to a fresh file and retarget ``current.json``.
+
+    On destructive reloads (any removed asset), also writes a clearly-named
+    copy of the pre-migration state next to it so the operator can recover
+    the prior state by hand. Returns the path of the new state file, or
+    None when migration is a no-op (no state actually changed — happens for
+    pure parameter changes that don't add or remove ids).
+
+    Atomicity: we save the new state file, then retarget the symlink via
+    ``_atomic_symlink``. If the daemon crashes between save and retarget,
+    ``current.json`` still points at the old (pre-migration) dated state,
+    which remains valid against the *old* config — and the new config is
+    not yet swapped in memory, so the next start re-reads the old config
+    and continues consistently.
+    """
+    # Defensive: callers gate on ``diff.changes_asset_set``, which is true
+    # iff the candidate adds or removes an id. An add always inserts a fresh
+    # entry into the migrated state, so ``migrated == old`` cannot hold for
+    # an add. It *can* hold for a remove if the live state was already
+    # missing the asset being removed (state-config drift pre-existing the
+    # reload) — in that case migration is a no-op and there is nothing to
+    # write or back up. Returning early keeps the symlink pointed at the
+    # existing dated state.
+    if migrated_state == old_state:
+        return None
+    iso = _now_iso_compact()
+    new_name = f"migrate-{iso}.json"
+    new_path = state_dir / new_name
+
+    # Order is load-bearing for crash safety:
+    #   1. Write the migrated state. If this raises, nothing is on disk yet —
+    #      no stray backup, no orphaned files for the operator to triage.
+    #   2. Write the pre-migration backup (destructive reloads only). If this
+    #      raises, delete the migrated file we just wrote so the failed
+    #      migration leaves nothing referenced or unreferenced behind.
+    #   3. Retarget the symlink. This is the atomic commit point; only after
+    #      it returns is the migration live. If the retarget itself raises
+    #      (cross-FS replace, EIO), unlink both files we just wrote so a
+    #      repeating FS failure doesn't fill STATE_DIR with orphan
+    #      migrate-/before-migrate- pairs on every retry.
+    migrated_state.save(new_path)
+
+    backup_path: Optional[Path] = None
+    if diff.is_destructive:
+        backup_path = state_dir / f"before-migrate-{iso}.json"
+        try:
+            old_state.save(backup_path)
+        except OSError:
+            try:
+                new_path.unlink()
+            except OSError:
+                pass
+            raise
+
+    try:
+        _atomic_symlink(new_name, state_path)
+    except OSError:
+        for p in (new_path, backup_path):
+            if p is None:
+                continue
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise
+    if backup_path is not None:
+        logger.warning(
+            "destructive config reload: pre-migration state backed up to %s",
+            backup_path,
+        )
+    return new_path
+
+
 def _maybe_reload_plant_config(
     config_file: Optional[Path],
     current: Optional[PlantConfig],
     reload_state: _ConfigReloadState,
     state_path: Optional[Path] = None,
+    state_dir: Optional[Path] = None,
 ) -> Optional[PlantConfig]:
     """Re-stat ``config_file`` and swap ``current`` if it changed and validates.
 
@@ -280,14 +409,21 @@ def _maybe_reload_plant_config(
     Reload is rejected (and ``current`` returned) when:
       - the new file is unreadable (missing, bad JSON);
       - validation fails (full ValidationResult is logged);
-      - the asset id set differs from ``current`` (deferred to the live
-        add/remove task);
-      - the current DispatchState at ``state_path`` is no longer feasible
-        under the new config (e.g. SoC outside the new [floor, capacity]).
+      - ``dt_h`` differs from ``current`` (the MILP grid is not hot-swappable
+        because ``UnitState.time_in_state_steps`` is counted in dt_h units);
+      - any id has moved between families (HP↔Boiler↔CHP↔Storage) — operator
+        re-does this as remove + add in two separate edits;
+      - the migrated DispatchState at ``state_path`` is no longer feasible
+        under the new config (SoC outside the new [floor, capacity]).
 
-    If ``state_path`` is None or the state file doesn't exist, the
-    feasibility check is skipped (the worker's normal path already requires
-    ``current.json`` and will fail loudly later if it is missing).
+    Add/remove handling. When ``state_dir`` is provided, the function
+    performs the state migration in-place: kept assets pass through, removed
+    ids are dropped, added ids get cold-start entries. The migrated state is
+    written to a new file in ``state_dir`` and ``current.json`` is retargeted
+    atomically; on destructive (remove) reloads, a pre-migration backup is
+    written next to it. Without ``state_dir`` the function performs a
+    read-only feasibility check on the pre-migration state — used by tests
+    and dry-run callers.
 
     A successful reload to an identical config (content unchanged, only
     mtime bumped via ``touch``) is a silent no-op: watermark advances, no
@@ -302,23 +438,42 @@ def _maybe_reload_plant_config(
         return current
     if reload_state.last_mtime_ns is not None and mtime_ns == reload_state.last_mtime_ns:
         return current
+    # Watermark policy: advance immediately so an invalid-but-unchanged file
+    # doesn't get re-read and re-logged every cycle. Failures that the
+    # operator may want a transient retry for (read I/O, persist I/O) roll
+    # the watermark back to ``prev_mtime_ns`` below; validation rejections
+    # keep the advanced watermark so the operator's next save is what
+    # triggers the next attempt.
+    prev_mtime_ns = reload_state.last_mtime_ns
     reload_state.last_mtime_ns = mtime_ns
     try:
         candidate, result = PlantConfig.from_json_with_result(config_file)
     except ConfigValidationError as e:
         _log_validation_result(config_file, e.result, applied=False)
         return current
-    except (ValueError, OSError) as e:
+    except ValueError as e:
         logger.error(
             "config reload rejected for %s: could not load (%s); keeping current config",
             config_file, e,
         )
         return current
+    except OSError as e:
+        # Transient FS issue between stat and read (file vanished, EIO, ...).
+        # Roll back the watermark so the next cycle retries; the operator's
+        # last-saved content is still in flight from the daemon's view.
+        reload_state.last_mtime_ns = prev_mtime_ns
+        logger.error(
+            "config reload could not read %s (%s); will retry next cycle",
+            config_file, e,
+        )
+        return current
 
     # No-op: ``touch`` or whitespace-only edits bump mtime but leave content
-    # equivalent. PlantConfig is a frozen dataclass so structural equality
-    # covers every field that matters. Silent return keeps logs clean.
-    if candidate == current:
+    # equivalent. Comparing via ConfigDiff (not dataclass equality) means a
+    # reorder of ``disabled_asset_ids`` — same set, different tuple order —
+    # is also treated as a no-op and stays silent in the log.
+    diff = ConfigDiff.between(current, candidate)
+    if diff.is_noop:
         return current
 
     # dt_h is the MILP grid resolution. UnitState.time_in_state_steps is
@@ -338,24 +493,36 @@ def _maybe_reload_plant_config(
             _log_validation_result(config_file, result, applied=False)
         return current
 
-    if not current.same_asset_set(candidate):
+    # Family-move guard: a single id appearing in both removed and added sets
+    # crossed a family boundary (HP→Boiler etc.). State schemas differ per
+    # family, and ``UnitState`` carries no family marker, so silently keeping
+    # the prior commit-state under a new family would mean the new asset
+    # inherits stale on/off and time_in_state from a fundamentally different
+    # unit. Refuse it: operator does this as remove + add in two edits.
+    family_moves = sorted(diff.added_unit_ids & diff.removed_unit_ids)
+    if family_moves:
         logger.error(
-            "config reload rejected for %s: asset id set changed — live add/remove "
-            "is a separate operation. Keeping current config.",
-            config_file,
+            "config reload rejected for %s: asset id(s) %s changed family "
+            "(HP/Boiler/CHP). Re-do as two separate edits: remove the id in "
+            "one save, then add it back in its new family.",
+            config_file, family_moves,
         )
-        # Still surface any warnings the candidate would have had, so the
-        # operator sees the full picture before retrying.
         if result.warnings:
             _log_validation_result(config_file, result, applied=False)
         return current
 
-    # State feasibility: a parameter-only change can still strand the stored
-    # SoC outside the new [floor, capacity]. Catch it here rather than letting
-    # the next MILP solve fail with a less actionable infeasibility.
+    # State migration + feasibility. Compute the migrated state once and use
+    # it both for the feasibility gate and (when state_dir is given) for the
+    # on-disk swap below. Migrating before the feasibility check matters
+    # for add/remove: ``feasible_against`` skips ids absent from the state,
+    # so we must align state to the candidate *first* (added storages
+    # populated with their soc_init, removed ids dropped) and only then
+    # check whether the kept entries respect the new bounds.
+    migrated_state: Optional[DispatchState] = None
+    old_state: Optional[DispatchState] = None
     if state_path is not None and state_path.exists():
         try:
-            state = DispatchState.load(state_path)
+            old_state = DispatchState.load(state_path)
         except (ValueError, KeyError, TypeError, OSError) as e:
             # If state is unreadable the daemon has bigger problems; the
             # next _run_one will surface it. Don't block the reload on it.
@@ -365,10 +532,11 @@ def _maybe_reload_plant_config(
                 state_path, e,
             )
         else:
-            problems = state.feasible_against(candidate)
+            migrated_state = old_state.migrate_to(candidate)
+            problems = migrated_state.feasible_against(candidate)
             if problems:
                 logger.error(
-                    "config reload rejected for %s: current state is infeasible "
+                    "config reload rejected for %s: migrated state is infeasible "
                     "under the new config:\n%s\n"
                     "Adjust the offending bound or re-seed state before retrying.",
                     config_file,
@@ -378,11 +546,43 @@ def _maybe_reload_plant_config(
                     _log_validation_result(config_file, result, applied=False)
                 return current
 
+    # If state_dir is provided and migration actually changed anything, write
+    # the new state file and retarget current.json before returning the new
+    # config. This must happen *before* the in-memory config swap (the
+    # function's return value) so the next _run_one reads a state that
+    # matches the config it will be solving against.
+    if (
+        state_dir is not None
+        and state_path is not None
+        and old_state is not None
+        and migrated_state is not None
+        and diff.changes_asset_set
+    ):
+        try:
+            _persist_migrated_state(
+                state_dir, state_path, old_state, migrated_state, diff,
+            )
+        except OSError as e:
+            # Persist is the only failure path that can leave the daemon in
+            # an "operator-saved but not applied" state for a transient I/O
+            # reason (ENOSPC, FS hiccup). Roll the watermark back so the
+            # next cycle retries the swap; the in-memory config stays on
+            # the previous version until that retry succeeds.
+            reload_state.last_mtime_ns = prev_mtime_ns
+            logger.error(
+                "config reload rejected for %s: failed to persist migrated "
+                "state (%s); will retry next cycle",
+                config_file, e,
+            )
+            if result.warnings:
+                _log_validation_result(config_file, result, applied=False)
+            return current
+
     if result.warnings:
         _log_validation_result(config_file, result, applied=True)
     logger.info(
-        "config reloaded from %s (parameter-only change; asset set unchanged)",
-        config_file,
+        "config reloaded from %s (%s)",
+        config_file, _format_diff_summary(diff),
     )
     return candidate
 
@@ -604,11 +804,20 @@ def _worker(
             # observe the new config — they wouldn't have used it anyway.
             # Pass state_path so the reload can revert if the candidate's new
             # SoC bounds would strand the currently-stored state.
-            plant_config = _maybe_reload_plant_config(
-                cfg.config_file, plant_config, reload_state,
-                state_path=cfg.state_dir / CURRENT_NAME,
-            )
+            #
+            # Wrap reload + run in the same broad guard: _maybe_reload catches
+            # its known errors (validation, OSError, ValueError) and returns
+            # the prior config. Anything outside that set would otherwise kill
+            # the worker thread silently while the scheduler keeps enqueuing.
+            # Keep the last-good plant_config on failure and let the next
+            # cycle retry; the reload's watermark policy already prevents
+            # spinning on the same broken file.
             try:
+                plant_config = _maybe_reload_plant_config(
+                    cfg.config_file, plant_config, reload_state,
+                    state_path=cfg.state_dir / CURRENT_NAME,
+                    state_dir=cfg.state_dir,
+                )
                 _run_one(cfg, solve_time, plant_config=plant_config)
             except Exception:
                 logger.exception("cycle crashed for solve_time=%s", solve_time.isoformat())

@@ -817,3 +817,131 @@ def test_same_asset_set_handles_empty_families():
     )
     same = replace(cfg, gas_price_eur_mwh_hs=40.0)
     assert cfg.same_asset_set(same) is True
+
+
+# --------------------------------------------------------------------------- #
+# disabled_asset_ids — operator-forced off-switch. The asset stays registered
+# and keeps its state; the optimizer is constrained to zero output. Validator
+# rejects unknown / duplicate / shape-broken entries before they ever reach
+# the MILP and rejects an all-producers-off plant as infeasible by intent.
+# --------------------------------------------------------------------------- #
+
+
+def test_disabled_asset_ids_default_is_empty():
+    """A config without disabled_asset_ids constructs cleanly and yields ()."""
+    cfg = PlantConfig.legacy_default()
+    assert cfg.disabled_asset_ids == ()
+    assert cfg.is_enabled("hp") is True
+
+
+def test_is_enabled_reflects_membership():
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("hp",))
+    assert cfg.is_enabled("hp") is False
+    assert cfg.is_enabled("boiler") is True
+
+
+def test_disabled_asset_ids_round_trips_via_to_dict_from_dict():
+    """to_dict emits the list, from_dict restores it: required for the live
+    reload path to ever see a disable change."""
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=("hp", "storage"))
+    payload = cfg.to_dict()
+    assert payload["disabled_asset_ids"] == ["hp", "storage"]
+    restored = PlantConfig.from_dict(payload)
+    assert restored.disabled_asset_ids == ("hp", "storage")
+    assert restored == cfg
+
+
+def test_disabled_asset_ids_input_list_is_coerced_to_tuple():
+    """Frozen dataclass invariant — like the four asset family fields."""
+    cfg = replace(PlantConfig.legacy_default(), disabled_asset_ids=["hp"])
+    assert cfg.disabled_asset_ids == ("hp",)
+
+
+def test_unknown_disabled_id_is_error():
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = ["does-not-exist"]
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    codes = {i.code for i in result.errors}
+    assert Codes.UNKNOWN_DISABLED_ID in codes
+    # And from_dict raises with the same code on .result
+    with pytest.raises(ConfigValidationError) as ei:
+        PlantConfig.from_dict(payload)
+    assert any(i.code == Codes.UNKNOWN_DISABLED_ID for i in ei.value.result.errors)
+
+
+def test_duplicate_disabled_id_is_error():
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = ["hp", "hp"]
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    codes = [i.code for i in result.errors]
+    assert Codes.DUPLICATE_DISABLED_ID in codes
+
+
+@pytest.mark.parametrize("bad", ["", "  ", " hp", "hp ", 0, None, True])
+def test_bad_disabled_id_is_error(bad):
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = [bad]
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    assert any(i.code == Codes.BAD_DISABLED_ID for i in result.errors), result.errors
+
+
+def test_disabled_asset_ids_not_a_list_is_shape_error():
+    """Mistyping the field (e.g. ``"hp"`` instead of ``["hp"]``) should
+    produce one clear shape error, not a cascade of per-character complaints."""
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = "hp"
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    shape_errors = [i for i in result.errors
+                    if i.code == Codes.ASSET_FIELDS_WRONG and i.path == "disabled_asset_ids"]
+    assert len(shape_errors) == 1
+    # Per-item disable checks must be suppressed once the shape is wrong —
+    # otherwise the operator gets BAD_DISABLED_ID for every character.
+    assert not any(i.code == Codes.BAD_DISABLED_ID for i in result.errors)
+
+
+def test_all_heat_producers_disabled_is_error():
+    """Plant has registered producers but every one is in the disabled list:
+    demand cannot be met, refuse the config."""
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = ["hp", "boiler", "chp"]
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    assert any(i.code == Codes.ALL_HEAT_PRODUCERS_DISABLED for i in result.errors)
+
+
+def test_all_heat_producers_disabled_not_fired_when_zero_producers():
+    """Empty plant fires ZERO_HEAT_PRODUCERS, not the disabled variant —
+    the conditions are disjoint and the operator gets the relevant message."""
+    payload = _legacy_payload()
+    payload["heat_pumps"] = []
+    payload["boilers"] = []
+    payload["chps"] = []
+    payload["disabled_asset_ids"] = []
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    codes = {i.code for i in result.errors}
+    assert Codes.ZERO_HEAT_PRODUCERS in codes
+    assert Codes.ALL_HEAT_PRODUCERS_DISABLED not in codes
+
+
+def test_storage_only_disabled_is_allowed():
+    """Disabling just a storage is legal: the producers still meet demand."""
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = ["storage"]
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    assert result.ok, result.errors
+
+
+def test_some_producers_disabled_is_allowed():
+    """Disabling a subset of producers is fine — operator can shed capacity."""
+    payload = _legacy_payload()
+    payload["disabled_asset_ids"] = ["hp", "boiler"]  # CHP remains
+    result = validate_plant_payload(payload, CONFIG_SCHEMA_VERSION)
+    assert result.ok, result.errors
+
+
+def test_same_asset_set_unaffected_by_disable_toggle():
+    """Disable is a parameter-level change, not an asset-set change — the
+    daemon's live-reload gate must let a disable edit through."""
+    base = PlantConfig.legacy_default()
+    toggled = replace(base, disabled_asset_ids=("hp",))
+    assert base.same_asset_set(toggled) is True
+    assert toggled.same_asset_set(base) is True

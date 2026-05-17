@@ -182,10 +182,18 @@ class PlantConfig:
     chps: tuple[CHPParams, ...]
     storages: tuple[StorageParams, ...]
 
+    # Operator-forced off-switch (emergency-off semantics): each id must
+    # reference an existing asset. The asset stays registered, keeps its
+    # parameters and DispatchState entry, but the MILP is constrained to
+    # zero output for it until the id is removed from this list. Default
+    # empty; toggling is a parameter-only reload (same_asset_set is
+    # unaffected by disabling).
+    disabled_asset_ids: tuple[str, ...] = ()
+
     def __post_init__(self) -> None:
         # Frozen dataclass: coerce list inputs to tuples without mutating self.
         # Must happen before validation since the validator iterates each tuple.
-        for fname in ("heat_pumps", "boilers", "chps", "storages"):
+        for fname in ("heat_pumps", "boilers", "chps", "storages", "disabled_asset_ids"):
             v = getattr(self, fname)
             if not isinstance(v, tuple):
                 object.__setattr__(self, fname, tuple(v))
@@ -211,6 +219,15 @@ class PlantConfig:
             + [b.id for b in self.boilers]
             + [c.id for c in self.chps]
         )
+
+    def is_enabled(self, asset_id: str) -> bool:
+        """True iff ``asset_id`` is not in ``disabled_asset_ids``.
+
+        Cheap helper used by the MILP builder and dashboard. Does *not*
+        check that the id is registered — that's the validator's job; this
+        function answers the operational question, not the topological one.
+        """
+        return asset_id not in self.disabled_asset_ids
 
     def same_asset_set(self, other: "PlantConfig") -> bool:
         """True iff ``other`` has exactly the same unit and storage IDs as self.
@@ -295,6 +312,7 @@ class PlantConfig:
             "boilers": [asdict(b) for b in self.boilers],
             "chps": [asdict(c) for c in self.chps],
             "storages": [asdict(s) for s in self.storages],
+            "disabled_asset_ids": list(self.disabled_asset_ids),
         }
 
     @classmethod
@@ -328,6 +346,7 @@ class PlantConfig:
             storages=tuple(
                 StorageParams(**item) for item in payload.get("storages", [])
             ),
+            disabled_asset_ids=tuple(payload.get("disabled_asset_ids", ())),
         )
         return cfg, result
 
