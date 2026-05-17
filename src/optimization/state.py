@@ -160,6 +160,51 @@ class DispatchState:
         }
         return cls(timestamp=ts, units=units, storages=storages)
 
+    def migrate_to(self, candidate: "PlantConfig") -> "DispatchState":
+        """Return a state aligned to ``candidate``'s asset registry, by id.
+
+        Kept assets pass through byte-for-byte (no SoC perturbation, no TIS
+        reset). Removed assets are dropped from ``units`` / ``storages``;
+        their state is discarded. Added units are initialized off with
+        ``TIS_LONG`` (no min-up/min-down constraints bind, identical to a
+        fresh ``cold_start`` entry). Added storages start at
+        ``candidate.<storage>.soc_init_mwh_th``.
+
+        ``UnitState`` is family-agnostic, so an id that moved between
+        ``heat_pumps`` / ``boilers`` / ``chps`` would keep its old
+        commit-state — almost certainly wrong, since per-family commit
+        semantics differ. The reload path therefore rejects family-move
+        configs at the ``ConfigDiff`` level (the moved id appears in both
+        ``removed_unit_ids`` and ``added_unit_ids``); operators do this as
+        two separate edits.
+
+        The returned state's ``timestamp`` matches self's: migration is a
+        re-registration, not a forward step on the clock.
+        """
+        cand_unit_ids = set(candidate.all_unit_ids())
+        cand_storage_ids = {s.id for s in candidate.storages}
+
+        new_units: dict[str, UnitState] = {
+            uid: us for uid, us in self.units.items() if uid in cand_unit_ids
+        }
+        for uid in cand_unit_ids - set(new_units):
+            new_units[uid] = UnitState(on=0, time_in_state_steps=TIS_LONG)
+
+        new_storages: dict[str, StorageState] = {
+            sid: ss for sid, ss in self.storages.items() if sid in cand_storage_ids
+        }
+        storage_by_id = {s.id: s for s in candidate.storages}
+        for sid in cand_storage_ids - set(new_storages):
+            new_storages[sid] = StorageState(
+                soc_mwh_th=storage_by_id[sid].soc_init_mwh_th,
+            )
+
+        return DispatchState(
+            timestamp=self.timestamp,
+            units=new_units,
+            storages=new_storages,
+        )
+
     def feasible_against(self, config: "PlantConfig") -> list[str]:
         """Return a list of infeasibility messages, empty if state is feasible.
 
