@@ -160,6 +160,39 @@ def build_model(
         bounds=lambda m, s, t: (storage_by_id[s].floor_mwh_th, storage_by_id[s].capacity_mwh_th),
     )
 
+    # ---------------------- Disabled assets ----------------------
+    # Operator-forced off-switch: the asset stays registered (and keeps its
+    # state) but every binary commit variable is pinned to 0, which through
+    # the per-asset min/max constraints below forces P_el / Q / fuel to 0
+    # too. Storages additionally get their charge/discharge flows fixed to 0
+    # and a frozen SoC dynamic (see _soc_dyn) so a disabled storage doesn't
+    # silently drift below floor over multi-cycle disables — turning the
+    # asset off is a pause, not a slow drain.
+    #
+    # The per-asset min-up/down init-state-fixing blocks below explicitly
+    # skip disabled units: forcing z=1 to honor a residual min-up while
+    # also forcing z=0 to disable is infeasible. The natural shutdown
+    # (z_prev=1, z[1]=0) emits d=1 at t=1 and then min_down is satisfied
+    # by z staying at 0 for the rest of the horizon.
+    disabled_ids: frozenset[str] = frozenset(config.disabled_asset_ids)
+    for hp in config.heat_pumps:
+        if hp.id in disabled_ids:
+            for t in m.T_set:
+                m.z_hp[hp.id, t].fix(0)
+    for b in config.boilers:
+        if b.id in disabled_ids:
+            for t in m.T_set:
+                m.z_boiler[b.id, t].fix(0)
+    for c in config.chps:
+        if c.id in disabled_ids:
+            for t in m.T_set:
+                m.z_chp[c.id, t].fix(0)
+    for s in config.storages:
+        if s.id in disabled_ids:
+            for t in m.T_set:
+                m.Q_charge[s.id, t].fix(0.0)
+                m.Q_discharge[s.id, t].fix(0.0)
+
     # ---------------------- Objective ----------------------
 
     gas_cost = config.gas_cost_eur_mwh_hs
@@ -231,7 +264,12 @@ def build_model(
 
     # Initial-state fixing: if the unit just started/stopped, the first few
     # timesteps are forced to keep its commitment until min-up/down clears.
+    # Disabled boilers are already fixed to z=0 above; skipping them here
+    # avoids the infeasible fix(1) + fix(0) collision when a unit is
+    # disabled mid-run.
     for b in config.boilers:
+        if b.id in disabled_ids:
+            continue
         init = state.units[b.id]
         if init.on == 1 and init.time_in_state_steps < b.min_up_steps:
             for t in range(1, min(b.min_up_steps - init.time_in_state_steps + 1, T + 1)):
@@ -285,6 +323,8 @@ def build_model(
     )
 
     for c in config.chps:
+        if c.id in disabled_ids:
+            continue
         init = state.units[c.id]
         if init.on == 1 and init.time_in_state_steps < c.min_up_steps:
             for t in range(1, min(c.min_up_steps - init.time_in_state_steps + 1, T + 1)):
@@ -334,14 +374,22 @@ def build_model(
         rule=lambda m, s, t: m.Q_discharge[s, t]
         <= storage_by_id[s].discharge_max_mw_th * (1 - m.y_sto[s, t]),
     )
-    m.soc_dyn = pyo.Constraint(
-        m.STORAGE_SET, m.T_set,
-        rule=lambda m, s, t: m.SoC[s, t]
-        == m.SoC[s, t - 1]
-        + m.Q_charge[s, t] * dt
-        - m.Q_discharge[s, t] * dt
-        - storage_by_id[s].loss_mwh_per_step,
-    )
+    def _soc_dyn(m: pyo.ConcreteModel, s: str, t: int) -> pyo.Expression:
+        if s in disabled_ids:
+            # Disabled storage: charge/discharge fixed to 0 above, and the
+            # SoC is frozen across the horizon. Skipping the loss term is a
+            # deliberate operator-facing contract — "off = pause" — so that
+            # a multi-cycle disable cannot quietly drain SoC below floor.
+            return m.SoC[s, t] == m.SoC[s, t - 1]
+        return (
+            m.SoC[s, t]
+            == m.SoC[s, t - 1]
+            + m.Q_charge[s, t] * dt
+            - m.Q_discharge[s, t] * dt
+            - storage_by_id[s].loss_mwh_per_step
+        )
+
+    m.soc_dyn = pyo.Constraint(m.STORAGE_SET, m.T_set, rule=_soc_dyn)
 
     # Stash for downstream extract_dispatch / extract_state
     m._config = config
