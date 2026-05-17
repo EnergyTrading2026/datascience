@@ -831,16 +831,20 @@ def test_load_plant_config_with_watermark_stats_before_read(tmp_path, monkeypatc
     _write_config(config_path, base)
     pre_mtime = config_path.stat().st_mtime_ns
 
-    orig_from_json = PlantConfig.from_json
+    orig_from_json_with_result = PlantConfig.from_json_with_result
 
-    def racing_from_json(path):
+    def racing_from_json_with_result(path):
         # Simulate an operator write landing during the read.
         _bump_mtime(path)
-        return orig_from_json(path)
+        return orig_from_json_with_result(path)
 
-    monkeypatch.setattr(PlantConfig, "from_json", staticmethod(racing_from_json))
+    monkeypatch.setattr(
+        PlantConfig,
+        "from_json_with_result",
+        staticmethod(racing_from_json_with_result),
+    )
 
-    cfg, watermark = daemon._load_plant_config_with_watermark(config_path)
+    cfg, watermark, _result = daemon._load_plant_config_with_watermark(config_path)
 
     assert cfg == base
     # Watermark is the pre-read value, not the post-read one. So when the
@@ -869,10 +873,114 @@ def test_load_plant_config_with_watermark_tolerates_stat_failure(tmp_path, monke
     # own stat (inside Path.read_text) still works.
     monkeypatch.setattr(type(config_path), "stat", flaky_stat)
 
-    cfg, watermark = daemon._load_plant_config_with_watermark(config_path)
+    cfg, watermark, _result = daemon._load_plant_config_with_watermark(config_path)
 
     assert cfg == base
     assert watermark is None
+
+
+def test_load_plant_config_with_watermark_returns_warnings(tmp_path):
+    """Warnings on the startup load must reach the caller. Without this the
+    daemon would run a flagged config without ever logging the flag."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    # STORAGE_DISCHARGE_DISABLED: legal but warning-eligible.
+    with_warning = replace(
+        base,
+        storages=(replace(base.storages[0], discharge_max_mw_th=0.0),),
+    )
+    _write_config(config_path, with_warning)
+
+    _cfg, _watermark, result = daemon._load_plant_config_with_watermark(config_path)
+
+    assert not result.errors
+    assert result.warnings  # warning surfaced, not swallowed
+    codes = {issue.code for issue in result.warnings}
+    assert "STORAGE_DISCHARGE_DISABLED" in codes
+
+
+def test_log_startup_warnings_emits_warning_record(tmp_path, caplog):
+    """The startup warning logger must produce a WARNING record naming the
+    issue codes — that is the operator-facing observability fix."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    with_warning = replace(
+        base,
+        storages=(replace(base.storages[0], discharge_max_mw_th=0.0),),
+    )
+    _write_config(config_path, with_warning)
+    _cfg, _watermark, result = daemon._load_plant_config_with_watermark(config_path)
+
+    with caplog.at_level("WARNING", logger="optimization.daemon"):
+        daemon._log_startup_warnings(config_path, result)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "expected at least one WARNING record"
+    msg = "\n".join(r.message for r in warnings)
+    assert "STORAGE_DISCHARGE_DISABLED" in msg
+    assert str(config_path) in msg
+
+
+def test_load_plant_config_raises_with_full_result_on_multi_error_payload(tmp_path):
+    """``ConfigValidationError`` carries the full ValidationResult, not just
+    the first message. Without this the startup error log can only ever
+    surface one issue per boot attempt."""
+    config_path = tmp_path / "plant_config.json"
+    # Build a payload with independent errors in different places.
+    base_payload = PlantConfig.legacy_default().to_dict()
+    base_payload["gas_price_eur_mwh_hs"] = -1.0          # NEGATIVE
+    base_payload["heat_pumps"][0]["p_el_min_mw"] = 99.0  # MIN_EXCEEDS_MAX
+    base_payload["boilers"][0]["eff"] = 2.0              # EFF_OUT_OF_RANGE
+    config_path.write_text(json.dumps(base_payload, indent=2))
+
+    from optimization.config_validation import ConfigValidationError
+    try:
+        daemon._load_plant_config_with_watermark(config_path)
+    except ConfigValidationError as e:
+        codes = {i.code for i in e.result.errors}
+        assert {"NEGATIVE", "MIN_EXCEEDS_MAX", "EFF_OUT_OF_RANGE"} <= codes
+    else:
+        raise AssertionError("expected ConfigValidationError")
+
+
+def test_log_startup_validation_failure_logs_every_error(tmp_path, caplog):
+    """The startup error logger must enumerate every error, not just the
+    first one ``str(exc)`` would carry. This is the operator-facing fix on
+    the error side of the boot path."""
+    config_path = tmp_path / "plant_config.json"
+    base_payload = PlantConfig.legacy_default().to_dict()
+    base_payload["gas_price_eur_mwh_hs"] = -1.0
+    base_payload["heat_pumps"][0]["p_el_min_mw"] = 99.0
+    base_payload["boilers"][0]["eff"] = 2.0
+    config_path.write_text(json.dumps(base_payload, indent=2))
+
+    from optimization.config_validation import ConfigValidationError
+    try:
+        daemon._load_plant_config_with_watermark(config_path)
+    except ConfigValidationError as e:
+        with caplog.at_level("ERROR", logger="optimization.daemon"):
+            daemon._log_startup_validation_failure(config_path, e.result)
+
+    msg = "\n".join(r.message for r in caplog.records if r.levelname == "ERROR")
+    assert "NEGATIVE" in msg
+    assert "MIN_EXCEEDS_MAX" in msg
+    assert "EFF_OUT_OF_RANGE" in msg
+    assert str(config_path) in msg
+
+
+def test_log_startup_warnings_silent_when_no_warnings(tmp_path, caplog):
+    """Clean config: no spurious log record. Operators should only hear from
+    this logger when there is something to look at."""
+    config_path = tmp_path / "plant_config.json"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    _cfg, _watermark, result = daemon._load_plant_config_with_watermark(config_path)
+
+    with caplog.at_level("WARNING", logger="optimization.daemon"):
+        daemon._log_startup_warnings(config_path, result)
+
+    assert not result.warnings
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):

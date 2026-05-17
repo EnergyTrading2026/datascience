@@ -158,9 +158,48 @@ def _log_validation_result(
         )
 
 
+def _log_startup_warnings(config_file: Path, result: ValidationResult) -> None:
+    """Surface validation warnings observed during the daemon's initial load.
+
+    Errors abort startup before this is reached; warnings would otherwise be
+    silently dropped, hiding policy violations the operator should see on
+    first boot. Phrased distinctly from the reload path so a log grep can
+    tell first-boot warnings from later live-edit warnings.
+    """
+    if not result.warnings:
+        return
+    logger.warning(
+        "config loaded from %s with %d warning(s):\n%s",
+        config_file, len(result.warnings), _format_issues(result.warnings),
+    )
+
+
+def _log_startup_validation_failure(
+    config_file: Path, result: ValidationResult
+) -> None:
+    """Log every issue from a startup-time ConfigValidationError.
+
+    ``ConfigValidationError.__str__`` only carries the first error message,
+    so a plain ``logger.error("%s", e)`` would hide every additional issue.
+    The operator wants the full picture in one boot attempt, not a peel-the-
+    onion loop. Warnings are surfaced too — they are still relevant context
+    even when errors abort the boot.
+    """
+    if result.errors:
+        logger.error(
+            "config load rejected for %s: %d validation error(s)\n%s",
+            config_file, len(result.errors), _format_issues(result.errors),
+        )
+    if result.warnings:
+        logger.warning(
+            "config load for %s also produced %d warning(s):\n%s",
+            config_file, len(result.warnings), _format_issues(result.warnings),
+        )
+
+
 def _load_plant_config_with_watermark(
     config_file: Path,
-) -> tuple[PlantConfig, Optional[int]]:
+) -> tuple[PlantConfig, Optional[int], ValidationResult]:
     """Load PlantConfig and capture the pre-read mtime watermark.
 
     Stat happens BEFORE read so that a write landing between the two doesn't
@@ -169,15 +208,19 @@ def _load_plant_config_with_watermark(
     the older mtime; the next worker stat sees mtime has advanced and
     triggers a (potentially no-op) reload that catches up.
 
-    Returns ``(cfg, mtime_ns | None)``. ``None`` watermark means the next
-    worker iteration reloads on its first stat — safe fallback.
+    The returned ValidationResult carries any warnings the payload produced
+    so the caller can surface them at startup — errors are raised as
+    ``ConfigValidationError`` before this returns.
+
+    Returns ``(cfg, mtime_ns | None, result)``. ``None`` watermark means
+    the next worker iteration reloads on its first stat — safe fallback.
     """
     try:
         mtime_ns: Optional[int] = config_file.stat().st_mtime_ns
     except OSError:
         mtime_ns = None
-    cfg = PlantConfig.from_json(config_file)
-    return cfg, mtime_ns
+    cfg, result = PlantConfig.from_json_with_result(config_file)
+    return cfg, mtime_ns, result
 
 
 def _maybe_reload_plant_config(
@@ -581,12 +624,19 @@ def run(argv: list[str] | None = None) -> int:
     reload_state = _ConfigReloadState()
     if cfg.config_file is not None:
         try:
-            plant_config, reload_state.last_mtime_ns = (
+            plant_config, reload_state.last_mtime_ns, load_result = (
                 _load_plant_config_with_watermark(cfg.config_file)
             )
+        except ConfigValidationError as e:
+            # ConfigValidationError is a ValueError subclass — catch it first
+            # so the full ValidationResult is logged, not just str(e) which
+            # only carries the first error message.
+            _log_startup_validation_failure(cfg.config_file, e.result)
+            return 1
         except (OSError, ValueError) as e:
             logger.error("plant config load failed (%s): %s", cfg.config_file, e)
             return 1
+        _log_startup_warnings(cfg.config_file, load_result)
         logger.info(
             "loaded plant config from %s (%d HPs, %d boilers, %d CHPs, %d storages)",
             cfg.config_file, len(plant_config.heat_pumps), len(plant_config.boilers),
