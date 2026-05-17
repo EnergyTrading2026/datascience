@@ -42,6 +42,7 @@ notebooks = ["jupyter", "ipykernel", "matplotlib"]
 optimization-backtest = "optimization.backtest:main"
 optimization-init-state = "optimization.init_state:main"
 optimization-write-default-config = "optimization.write_default_config:main"
+optimization-config-diff = "optimization.config_diff_cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
