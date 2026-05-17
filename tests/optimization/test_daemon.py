@@ -563,27 +563,37 @@ def test_maybe_reload_applies_parameter_only_change(tmp_path):
     assert state.last_mtime_ns == config_path.stat().st_mtime_ns
 
 
-def test_maybe_reload_rejects_asset_id_diff(tmp_path, caplog):
-    """Adding an asset is Task 4 territory; reload must not swap and must say so."""
+def test_maybe_reload_rejects_family_move(tmp_path, caplog):
+    """Same string id moving between HP/Boiler/CHP/Storage is a destructive
+    schema change disguised as a rename; reload must refuse and tell the
+    operator to do it as two separate edits (remove then add)."""
+    from optimization.config import CHPParams
     config_path = tmp_path / "plant_config.json"
     base = PlantConfig.legacy_default()
     _write_config(config_path, base)
     state = daemon._ConfigReloadState(last_mtime_ns=config_path.stat().st_mtime_ns)
 
-    grown = replace(
+    moved = replace(
         base,
-        heat_pumps=base.heat_pumps + (
-            HeatPumpParams(id="hp_new", p_el_min_mw=1.0, p_el_max_mw=4.0, cop=3.5),
-        ),
+        boilers=(),
+        chps=base.chps + (CHPParams(
+            id="boiler",  # reuses the old boiler's id as a CHP
+            p_el_min_mw=1.0, p_el_max_mw=4.0,
+            eff_el=0.4, eff_th=0.4,
+            min_up_steps=4, min_down_steps=4,
+            startup_cost_eur=100.0,
+        ),),
     )
-    _write_config(config_path, grown)
+    _write_config(config_path, moved)
     _bump_mtime(config_path)
 
     with caplog.at_level("ERROR", logger="optimization.daemon"):
         result = daemon._maybe_reload_plant_config(config_path, base, state)
 
     assert result is base  # not swapped
-    assert any("asset id set changed" in r.message for r in caplog.records)
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "changed family" in msg
+    assert "'boiler'" in msg
     # Watermark advanced anyway — broken file should not re-trigger every cycle.
     assert state.last_mtime_ns == config_path.stat().st_mtime_ns
 
@@ -1068,6 +1078,240 @@ def test_log_startup_warnings_silent_when_no_warnings(tmp_path, caplog):
 
     assert not result.warnings
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+# --------------------------------------------------------------------------- #
+# Live add/remove of assets (Task 4): the reload path runs
+# DispatchState.migrate_to on the candidate config, retargets current.json
+# to the migrated state, and backs up the pre-migration state on any
+# destructive (remove) edit.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_state_and_link(state_dir, state):
+    """Helper: write a dated state and point current.json at it via symlink.
+    The reload code retargets the symlink; tests using --state-path on a
+    plain file would skip that retarget path entirely."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    dated = state_dir / "seed.json"
+    state.save(dated)
+    current = state_dir / "current.json"
+    if current.exists() or current.is_symlink():
+        current.unlink()
+    current.symlink_to(dated.name)
+    return current
+
+
+def test_maybe_reload_applies_add_unit_and_migrates_state(tmp_path, caplog):
+    """Adding an HP triggers state migration: current.json points to a new
+    file that contains the original entries plus an off/TIS_LONG entry for
+    the new HP. The original dated state file remains on disk."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+
+    grown = replace(
+        base,
+        heat_pumps=base.heat_pumps + (
+            HeatPumpParams(id="hp_new", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.4),
+        ),
+    )
+    _write_config(config_path, grown)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    with caplog.at_level("INFO", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state,
+            state_path=state_dir / "current.json",
+            state_dir=state_dir,
+        )
+
+    assert result == grown
+    # current.json now points at a migrate-* file with the new asset entry.
+    loaded = DispatchState.load(state_dir / "current.json")
+    assert "hp_new" in loaded.units
+    assert loaded.units["hp_new"].on == 0
+    # Existing entries untouched.
+    for uid in ("hp", "boiler", "chp"):
+        assert uid in loaded.units
+    # Pre-migration file is still on disk (we point at the new one).
+    assert (state_dir / "seed.json").exists()
+    # No destructive backup written for a pure add.
+    assert not any(p.name.startswith("before-migrate-") for p in state_dir.iterdir())
+
+
+def test_maybe_reload_applies_remove_unit_and_writes_backup(tmp_path, caplog):
+    """Removing a boiler drops the boiler state and writes a before-migrate
+    backup; current.json is retargeted to the post-migration state."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+
+    shrunk = replace(base, boilers=())
+    _write_config(config_path, shrunk)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    with caplog.at_level("WARNING", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state,
+            state_path=state_dir / "current.json",
+            state_dir=state_dir,
+        )
+
+    assert result == shrunk
+    loaded = DispatchState.load(state_dir / "current.json")
+    assert "boiler" not in loaded.units
+    # Backup written, contains the original boiler entry.
+    backups = sorted(p for p in state_dir.iterdir() if p.name.startswith("before-migrate-"))
+    assert len(backups) == 1
+    pre = DispatchState.load(backups[0])
+    assert "boiler" in pre.units
+    # Operator-visible log line ("backed up to ...") fires on destructive edit.
+    assert any("backed up to" in r.message for r in caplog.records)
+
+
+def test_maybe_reload_param_only_change_does_not_retarget_or_backup(tmp_path):
+    """A parameter-only change must not touch the state file or write a backup."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+    original_target = (state_dir / "current.json").readlink()
+
+    bumped = replace(base, gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 5.0)
+    _write_config(config_path, bumped)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    result = daemon._maybe_reload_plant_config(
+        config_path, base, reload_state,
+        state_path=state_dir / "current.json",
+        state_dir=state_dir,
+    )
+
+    assert result.gas_price_eur_mwh_hs == bumped.gas_price_eur_mwh_hs
+    # Symlink target unchanged.
+    assert (state_dir / "current.json").readlink() == original_target
+    # No migrate-* or before-migrate-* files created.
+    assert not any(
+        p.name.startswith("migrate-") or p.name.startswith("before-migrate-")
+        for p in state_dir.iterdir()
+    )
+
+
+def test_maybe_reload_rejects_when_migrated_state_infeasible(tmp_path, caplog):
+    """Param change on a kept storage that strands its SoC after migration:
+    feasibility check on the migrated state rejects, no swap, no backup."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    seed_state = _cs(seed_ts)
+    # Shift SoC well below the proposed new floor so feasible_against trips.
+    seed_state.storages["storage"].soc_mwh_th = 60.0
+    _seed_state_and_link(state_dir, seed_state)
+
+    candidate = replace(
+        base,
+        storages=(replace(base.storages[0], floor_mwh_th=80.0),),
+    )
+    _write_config(config_path, candidate)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    with caplog.at_level("ERROR", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state,
+            state_path=state_dir / "current.json",
+            state_dir=state_dir,
+        )
+
+    assert result is base
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "infeasible" in msg
+    assert not any(p.name.startswith("before-migrate-") for p in state_dir.iterdir())
+
+
+def test_maybe_reload_disable_toggle_does_not_touch_state(tmp_path):
+    """Disable is a parameter-level change for the daemon: no add/remove,
+    no state migration, no backup — same code path as any other param edit."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+    original_target = (state_dir / "current.json").readlink()
+
+    toggled = replace(base, disabled_asset_ids=("hp",))
+    _write_config(config_path, toggled)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    result = daemon._maybe_reload_plant_config(
+        config_path, base, reload_state,
+        state_path=state_dir / "current.json",
+        state_dir=state_dir,
+    )
+
+    assert result.disabled_asset_ids == ("hp",)
+    assert (state_dir / "current.json").readlink() == original_target
+
+
+def test_maybe_reload_mixed_add_remove_param_writes_backup_once(tmp_path, caplog):
+    """End-to-end: an edit that adds an HP, removes a boiler, changes a param
+    on a kept asset and bumps a global. The reload must apply everything in
+    one go, write a single backup, retarget the symlink to a migrated state
+    containing the right unit set, and log a structured diff summary."""
+    config_path = tmp_path / "plant_config.json"
+    state_dir = tmp_path / "state"
+    base = PlantConfig.legacy_default()
+    _write_config(config_path, base)
+    seed_ts = pd.Timestamp("2026-05-07T13:00:00Z")
+    _seed_state_and_link(state_dir, _cs(seed_ts))
+
+    mixed = replace(
+        base,
+        heat_pumps=base.heat_pumps + (
+            HeatPumpParams(id="hp_new", p_el_min_mw=0.5, p_el_max_mw=4.0, cop=3.4),
+        ),
+        boilers=(),
+        chps=(replace(base.chps[0], startup_cost_eur=800.0),),
+        gas_price_eur_mwh_hs=base.gas_price_eur_mwh_hs + 5.0,
+    )
+    _write_config(config_path, mixed)
+    _bump_mtime(config_path)
+
+    reload_state = daemon._ConfigReloadState()
+    with caplog.at_level("INFO", logger="optimization.daemon"):
+        result = daemon._maybe_reload_plant_config(
+            config_path, base, reload_state,
+            state_path=state_dir / "current.json",
+            state_dir=state_dir,
+        )
+
+    assert result == mixed
+    loaded = DispatchState.load(state_dir / "current.json")
+    assert set(loaded.units) == {"hp", "hp_new", "chp"}  # boiler dropped, hp_new added
+    backups = [p for p in state_dir.iterdir() if p.name.startswith("before-migrate-")]
+    assert len(backups) == 1
+    msg = "\n".join(r.message for r in caplog.records)
+    # Structured diff summary reflects all four changes.
+    assert "added units ['hp_new']" in msg
+    assert "removed units ['boiler']" in msg
+    assert "param-changed units ['chp']" in msg
+    assert "globals changed" in msg
 
 
 def test_run_one_passes_none_when_no_plant_config(tmp_path, monkeypatch):

@@ -446,16 +446,56 @@ docker compose up -d --build
 Both `init-state` and the daemon read the same `CONFIG_FILE` env, so
 asset IDs stay in sync.
 
-The daemon re-stats `CONFIG_FILE` at every cycle boundary. Parameter-only
-edits (prices, efficiencies, limits, min-up/down, storage bounds) are
-picked up on the next forecast cycle without a restart. The swap is
-atomic between cycles, never inside an in-flight solve. Each candidate is
-fully validated first; a half-edited or invalid config is rejected with
-an `ERROR` log line and the daemon keeps running on the previously loaded
-config. The swap is also rejected if `dt_h` changed, if the asset id set
-changed, or if the stored SoC would land outside the new
-`[floor_mwh_th, capacity_mwh_th]` bounds — for any of those the operator
-must stop, re-seed, and restart as in the four-step block above.
+The daemon re-stats `CONFIG_FILE` at every cycle boundary. Parameter
+edits, disable toggles, and add/remove of assets are all picked up on
+the next forecast cycle without a restart. The swap is atomic between
+cycles, never inside an in-flight solve. Each candidate is fully
+validated first; a half-edited or invalid config is rejected with an
+`ERROR` log line and the daemon keeps running on the previously loaded
+config. The swap is also rejected if `dt_h` changed (the MILP grid is
+not hot-swappable), if any id moved between families (HP↔Boiler↔CHP↔
+Storage — operator does this as remove + add in two separate saves), or
+if the migrated state would strand the stored SoC outside the new
+`[floor_mwh_th, capacity_mwh_th]` bounds. The four-step stop/re-seed/
+restart block above is still the right path for an initial cold start
+or after multi-day disables that drifted state out of bounds.
+
+Add/remove of assets is live: the daemon migrates state at the next
+cycle boundary — added units start off with no min-up/down binding,
+added storages start at their `soc_init_mwh_th`, removed assets' state
+is dropped. On any destructive edit (something removed) the daemon
+writes a copy of the pre-migration state to
+`data/state/before-migrate-<ts>.json` next to the live state, so the
+operator can roll back by hand if needed:
+
+```bash
+# Recover the pre-edit state after a destructive reload.
+# current.json is a symlink — point it at the backup via an atomic
+# ln -sfn → mv, the same idiom the daemon uses internally. `cp` would
+# follow the symlink and overwrite the dated target file, corrupting
+# an unrelated state snapshot while leaving the symlink unchanged.
+docker compose stop optimization
+cd data/state
+ln -sfn before-migrate-2026-05-17T14-30-00-000000Z.json current.json.tmp \
+    && mv current.json.tmp current.json
+cd -
+docker compose up -d optimization
+```
+
+A dry-run CLI previews what the daemon will do without touching any
+file. Wire it into your deploy pipeline as a gate before copying a
+candidate over `CONFIG_FILE`:
+
+```bash
+optimization-config-diff \
+    --proposed data/config/plant_config.candidate.json \
+    --current  data/config/plant_config.json \
+    --state    data/state/current.json
+```
+
+Exit 0 means apply-able; exit 1 means a validation error, family-move,
+or post-migration infeasibility is blocking the swap. Warnings do not
+block.
 
 `state.covers(config)` is called per cycle inside `build_model`; on
 config/state drift the cycle raises `ValueError` and the daemon's
